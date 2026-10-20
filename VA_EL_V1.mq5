@@ -1,9 +1,9 @@
 //+------------------------------------------------------------------+
 //|                    VA_EL_V1 v1.29 - Volume Core                 |
-//|      Volume histogram and average only; no price-pattern logic.  |
+//|      Volume histogram and average only.  |
 //+------------------------------------------------------------------+
-#property copyright "© mladen (Enhanced VPE Engine Pro), 2026"
-#property link      "mladenfx@gmail.com"
+#property copyright "VE Pro), 2026"
+#property link      "cdm.thoigmail.com"
 #property version   "1.29"
 #property strict
 #property indicator_separate_window
