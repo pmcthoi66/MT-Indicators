@@ -335,28 +335,24 @@ double MarkValue(const int i,const int type)
 }
 bool MarkEnabled(const int type)
 {
-   if(InpNewEffortEngine) return type<=3;
-   if(type<=3) return InpUseC7CB;
-   if(type<=7) return InpUseStructure12;
-   return InpUseWickRetest;
+   return type>=0 && type<=3; // Compact builds always use the L engine.
 }
 
 bool IndexDisplayBar(const int i)
 {
-   if(InpShowEntryContext)
-      for(int type=0;type<10;type++)
-         if(MarkEnabled(type) && MarkValue(i,type)!=EMPTY_VALUE)
-         {
-            if(!AppendIndex(ContextBars,ContextCount,i) ||
-               !AppendIndex(ContextTypes,ContextCount,type)) return false;
-            ContextCount++;
-         }
+   // Compact L tooltips come from NewEvents, not the unused legacy context index.
    if(!InpShowHistory)
       for(int type=0;type<10;type++)
          if(MarkEnabled(type) && MarkValue(i,type)!=EMPTY_VALUE)
          {
-            if(!AppendIndex(RecentBars,RecentCount,i) ||
-               !AppendIndex(RecentTypes,RecentCount,type)) return false;
+            if(ArraySize(RecentBars)<5 && ArrayResize(RecentBars,5)<5) return false;
+            if(ArraySize(RecentTypes)<5 && ArrayResize(RecentTypes,5)<5) return false;
+            if(RecentCount>=5)
+            {
+               for(int k=1;k<5;k++) { RecentBars[k-1]=RecentBars[k];RecentTypes[k-1]=RecentTypes[k]; }
+               RecentCount=4;
+            }
+            RecentBars[RecentCount]=i;RecentTypes[RecentCount]=type;
             RecentCount++;
          }
    if(StrongWideWick[i]!=EMPTY_VALUE && (Up[i]!=EMPTY_VALUE || Down[i]!=EMPTY_VALUE))
@@ -372,7 +368,7 @@ double LiveSnapshotATR=0,LiveSnapshotClose=0,LiveSnapshotPrevious=0;
 datetime LiveSnapshotCutoff=0,LiveOriginTime[256];
 void RefreshLevelButtons()
 {
-   if(Prefix=="" || !InpEnabled || !InpNewEffortEngine) return;
+   if(Prefix=="" || !InpEnabled) return;
    for(int k=0;k<2;k++)
    {
       string name=Prefix+(k==0?"BTN_SD":"BTN_KL");bool on=k==0?LiveSDOn:LiveKLOn;
@@ -585,51 +581,66 @@ void RefreshRecent(const int count,const datetime &time[],const double &low[],co
    }
 }
 bool MetricCacheReady=false;
-int MetricCacheCount=0;
+int MetricCacheFirst=0,MetricCacheCount=0,MetricCacheCapacity=0;
 double CachedContextATR[],CachedTickRV[],CachedRealRV[];
 int CachedRealMissing[];
 void FreeMetricCache()
 {
-   MetricCacheReady=false;MetricCacheCount=0;
+   MetricCacheReady=false;MetricCacheFirst=0;MetricCacheCount=0;MetricCacheCapacity=0;
    ArrayFree(CachedContextATR);ArrayFree(CachedTickRV);ArrayFree(CachedRealRV);ArrayFree(CachedRealMissing);
 }
 void PrepareMetricCache(const int count,const int prev,const bool reset,const double &high[],
                         const double &low[],const double &close[],const long &ticks[],const long &volume[])
 {
-   int old=MetricCacheCount;
-   bool rebuild=reset || !MetricCacheReady || old>count || old<prev;
+   if(count<1 || count>ArraySize(high) || count>ArraySize(low) || count>ArraySize(close) ||
+      count>ArraySize(ticks) || count>ArraySize(volume)) { FreeMetricCache();return; }
+   int old=MetricCacheCount,oldFirst=MetricCacheFirst,capacity=InpStartupBars+32;
+   bool rebuild=reset || !MetricCacheReady || MetricCacheCapacity!=capacity || old>count || old<prev;
    MetricCacheReady=false;
-   if(ArrayResize(CachedContextATR,count,1024)<count || ArrayResize(CachedTickRV,count,1024)<count ||
-      ArrayResize(CachedRealRV,count,1024)<count || ArrayResize(CachedRealMissing,count,1024)<count)
+   if(capacity<1) { FreeMetricCache();return; }
+   if((ArraySize(CachedContextATR)!=capacity && ArrayResize(CachedContextATR,capacity)<capacity) ||
+      (ArraySize(CachedTickRV)!=capacity && ArrayResize(CachedTickRV,capacity)<capacity) ||
+      (ArraySize(CachedRealRV)!=capacity && ArrayResize(CachedRealRV,capacity)<capacity) ||
+      (ArraySize(CachedRealMissing)!=capacity && ArrayResize(CachedRealMissing,capacity)<capacity))
    { FreeMetricCache();return; } // Raw functions remain valid if allocation fails.
-   int start=rebuild?0:MathMax(0,MathMin(old-1,prev-1));
+   int first=MathMax(0,count-capacity),start=first,missing=0;
+   if(!rebuild)
+   {
+      start=MathMax(first,MathMax(0,MathMin(old-1,prev-1)));
+      if(start>0)
+      {
+         if(start-1>=oldFirst && start-1<old) missing=CachedRealMissing[(start-1)%capacity];
+         else { rebuild=true;start=first; } // A history jump has no retained prefix.
+      }
+   }
    for(int i=start;i<count;i++)
    {
-      CachedRealMissing[i]=(i>0?CachedRealMissing[i-1]:0)+(volume[i]<=0?1:0);
-      CachedContextATR[i]=0;CachedTickRV[i]=0;CachedRealRV[i]=0;
+      int slot=i%capacity;
+      missing+=(volume[i]<=0?1:0);CachedRealMissing[slot]=missing;
+      CachedContextATR[slot]=0;CachedTickRV[slot]=0;CachedRealRV[slot]=0;
       if(i>=15)
       {
          double sum=0;
          for(int k=i-14;k<i;k++)
             sum+=MathMax(high[k]-low[k],MathMax(MathAbs(high[k]-close[k-1]),MathAbs(low[k]-close[k-1])));
-         CachedContextATR[i]=sum/14.0;
+         CachedContextATR[slot]=sum/14.0;
       }
       if(i>=20)
       {
          double ts=0,rs=0;bool tk=true,rk=true;
          for(int j=i-20;j<i;j++)
          { if(ticks[j]<=0) tk=false;if(volume[j]<=0) rk=false;ts+=(double)ticks[j];rs+=(double)volume[j]; }
-         if(tk && ticks[i]>0 && ts>0) CachedTickRV[i]=(double)ticks[i]/(ts/20.0);
-         if(rk && volume[i]>0 && rs>0) CachedRealRV[i]=(double)volume[i]/(rs/20.0);
+         if(tk && ticks[i]>0 && ts>0) CachedTickRV[slot]=(double)ticks[i]/(ts/20.0);
+         if(rk && volume[i]>0 && rs>0) CachedRealRV[slot]=(double)volume[i]/(rs/20.0);
       }
    }
-   MetricCacheCount=count;MetricCacheReady=true;
+   MetricCacheFirst=first;MetricCacheCount=count;MetricCacheCapacity=capacity;MetricCacheReady=true;
 }
 
 double ContextATR(const int i,const double &high[],const double &low[],const double &close[])
 {
-   if(i<15) return 0;
-   if(MetricCacheReady && i<MetricCacheCount) return CachedContextATR[i];
+   if(i<15 || i>=ArraySize(high) || i>=ArraySize(low) || i>=ArraySize(close)) return 0;
+   if(MetricCacheReady && i>=MetricCacheFirst && i<MetricCacheCount) return CachedContextATR[i%MetricCacheCapacity];
    double sum=0;
    for(int k=i-14;k<i;k++)
       sum+=MathMax(high[k]-low[k],MathMax(MathAbs(high[k]-close[k-1]),MathAbs(low[k]-close[k-1])));
@@ -1267,8 +1278,9 @@ struct EntryQuality
 };
 double QualityRelativeVolume(const int i,const bool real,const long &ticks[],const long &volume[])
 {
-   if(i<20) return 0;
-   if(MetricCacheReady && i<MetricCacheCount) return real?CachedRealRV[i]:CachedTickRV[i];
+   if(i<20 || i>=ArraySize(ticks) || i>=ArraySize(volume)) return 0;
+   if(MetricCacheReady && i>=MetricCacheFirst && i<MetricCacheCount)
+      return real?CachedRealRV[i%MetricCacheCapacity]:CachedTickRV[i%MetricCacheCapacity];
    double sum=0;
    for(int j=i-20;j<i;j++)
    { double v=(double)(real?volume[j]:ticks[j]);if(v<=0) return 0;sum+=v; }
@@ -1451,8 +1463,10 @@ string BuildMTFTooltip(const int slot,const int i,const int count,const int dire
 bool UseRealWindow(const int first,const int last,const long &volume[])
 {
    if(!InpUseRealVolume) return false;
-   if(MetricCacheReady && first>=0 && last>=first && last<MetricCacheCount)
-      return CachedRealMissing[last]-(first>0?CachedRealMissing[first-1]:0)==0;
+   if(first<0 || last<first || last>=ArraySize(volume)) return false;
+   // Both prefix endpoints must still be in the ring; older windows use raw data.
+   if(MetricCacheReady && first>MetricCacheFirst && last<MetricCacheCount)
+      return CachedRealMissing[last%MetricCacheCapacity]-CachedRealMissing[(first-1)%MetricCacheCapacity]==0;
    for(int k=first;k<=last;k++) if(volume[k]<=0) return false;
    return true;
 }
@@ -1467,7 +1481,7 @@ struct NewSweepCandidate
 struct NewEffortEvent
 {
    int bar,origin,side,state,source; // 0=chờ,1=đã chạm giả định,2=hủy,3=hết hạn,4=không rõ thứ tự,6=chạm rồi vô hiệu
-   datetime stamp,knownStamp;
+   datetime stamp,knownStamp,originStamp;
    double zoneLow,zoneHigh,entry,stop,atr;
    bool invalidated;
    string evidence,reading,name,monitor;
@@ -1476,6 +1490,8 @@ NewSweepCandidate NewCandidates[2],ExhaustCandidates[2],LTrendPending[2];
 int LTrendQueuedAt[2];bool LTrendWasExhaustion[2];string LTrendWhy[2];
 NewEffortEvent NewEvents[];
 int NewEventCount=0,NewProcessed=-1,NewActive[2];
+bool NewReplayPending=false,MTFHistoryWaiting=false;
+ulong MTFRetryAfter=0;
 struct LContinuationState
 {
    int phase,baseBar,lastBase,peakBar,pullStart,extremeBar,lastOpposite,qualifiedAt;
@@ -1511,6 +1527,7 @@ NewSweepCandidate LProposal[2];double LProposalScore[2];
 void ResetNewEffortState()
 {
    NewProcessed=-1;NewEventCount=0;ArrayFree(NewEvents);
+   NewReplayPending=false;MTFHistoryWaiting=false;MTFRetryAfter=0;
    ResetPro();ResetLGenerators();ResetLTurns();ResetLLocations();SellTopCandidate.active=false;SellTopStarted=-1;
    for(int k=0;k<2;k++)
    {
@@ -1531,11 +1548,12 @@ string NewEventTip(const NewEffortEvent &e)
    return (e.side>0?"BUY LIMIT":"SELL LIMIT")+" — KHÔNG ĐUỔI GIÁ\n"+e.evidence+"; "+e.reading+
       "\nVùng "+DoubleToString(e.zoneLow,_Digits)+"–"+DoubleToString(e.zoneHigh,_Digits)+
       "; mức chờ "+DoubleToString(e.entry,_Digits)+"; vô hiệu "+DoubleToString(e.stop,_Digits)+
-      "\n"+NewEventStatus(e)+(e.monitor==""?"":"; "+e.monitor)+"; biết tại đóng nến "+TimeToString(e.knownStamp);
+      "\n"+NewEventStatus(e)+(e.monitor==""?"":"; "+e.monitor)+
+      "; gốc tại "+TimeToString(e.originStamp)+"; biết tại đóng nến "+TimeToString(e.knownStamp);
 }
 void RenderNewEvent(const int id)
 {
-   if(NewRenderDeferred || !InpEnabled || !InpShowEntryContext || Prefix=="" || id<0 || id>=NewEventCount) return;
+   if(NewRenderDeferred || !InpEnabled || Prefix=="" || id<0 || id>=NewEventCount) return;
    if(!InpShowHistory && id<NewEventCount-5) return;
    NewEffortEvent e=NewEvents[id];
    if(ObjectFind(0,e.name)>=0 && ObjectGetInteger(0,e.name,OBJPROP_TYPE)!=OBJ_TEXT) ObjectDelete(0,e.name);
@@ -1546,7 +1564,8 @@ void RenderNewEvent(const int id)
    ObjectSetInteger(0,e.name,OBJPROP_FONTSIZE,7);ObjectSetString(0,e.name,OBJPROP_TEXT,"L");
    ObjectSetInteger(0,e.name,OBJPROP_HIDDEN,true);ObjectSetInteger(0,e.name,OBJPROP_SELECTABLE,false);
    ObjectSetInteger(0,e.name,OBJPROP_COLOR,e.state==0?clrAqua:e.state==1?clrGold:clrSilver);
-   ObjectSetString(0,e.name,OBJPROP_TOOLTIP,NewEventTip(e));
+   string tip=InpShowEntryContext?NewEventTip(e):NewEventStatus(e)+"; biết tại đóng nến "+TimeToString(e.knownStamp);
+   ObjectSetString(0,e.name,OBJPROP_TOOLTIP,tip);
 }
 void NotifyNewEvent(const string message,const bool notify)
 {
@@ -2471,7 +2490,8 @@ bool CreateNewEvent(const int slot,const int i,const datetime &time[],const doub
       return false; // Không phát L ở nến này, không gắn volume nến sau vào nến trước.
    }
    NewEffortEvent e;
-   e.bar=i;e.origin=c.bar;e.stamp=time[c.bar];e.knownStamp=time[i]+PeriodSeconds(_Period);e.source=exhaustion?3:c.route;e.invalidated=false;e.side=c.side;e.state=0;e.atr=atr;e.stop=stop;
+   e.bar=i;e.origin=c.bar;e.stamp=time[i];e.originStamp=time[c.bar];e.knownStamp=time[i+1];
+   e.source=exhaustion?3:c.route;e.invalidated=false;e.side=c.side;e.state=0;e.atr=atr;e.stop=stop;
    double width=MathMax(0.1*atr,MathMin(InpNewZoneMaxATR*atr,MathAbs(c.bodyEdge-c.extreme)+0.05*atr));
    e.zoneLow=c.side>0?c.extreme:c.extreme-width;
    e.zoneHigh=c.side>0?c.extreme+width:c.extreme;
@@ -2494,10 +2514,14 @@ bool CreateNewEvent(const int slot,const int i,const datetime &time[],const doub
    if(locationVolumeException) e.evidence+="; ngoại lệ: test vùng, hai Close giữ và lực cũ mất hiệu quả";
    e.evidence+="; Vol xác nhận/MA20="+DoubleToString(confirmRV,2)+
       (InpLVolumeLock?(realConfirm?"; khóa Vol real ON":"; khóa Vol tick ON"):"; khóa Vol OFF");
-   PivotMarketReading m;ReadPivotMarket(i,open,high,low,close,ticks,volume,m);
-   e.reading=m.ready?m.foundation:"nền chưa đủ xác nhận";
-   e.reading+="; "+flowReason;
-   string proSnapshot=ProSummary();if(proSnapshot!="") e.reading+="; "+proSnapshot;
+   e.reading="";
+   if(InpShowEntryContext)
+   {
+      PivotMarketReading m;ReadPivotMarket(i,open,high,low,close,ticks,volume,m);
+      e.reading=m.ready?m.foundation:"nền chưa đủ xác nhận";
+      e.reading+="; "+flowReason;
+      string proSnapshot=ProSummary();if(proSnapshot!="") e.reading+="; "+proSnapshot;
+   }
    if(InpShowEntryContext && (InpMTFZones || InpMTFKeyLevels))
    {
       string mtf=BuildMTFTooltip(slot,i,ArraySize(time),c.side,time,high,low,close);
@@ -2922,7 +2946,7 @@ void DrawLForecast(const int slot,const datetime &time[],const int i)
    string name=Prefix+"LF_"+IntegerToString(slot),text=name+"_TEXT";
    if(!LF[slot].active) { ObjectDelete(0,name);ObjectDelete(0,text);ObjectDelete(0,name+"_SL");ObjectDelete(0,name+"_SL_PRICE");return; }
    LForecastState f=LF[slot];
-   datetime begin=time[f.born]+PeriodSeconds(_Period);
+   datetime begin=time[f.born+1]; // First chart bar where this closed-bar forecast was available.
    datetime finish=begin+(datetime)(InpForecastLife*PeriodSeconds(_Period));
    color ink=f.side>0?InpUpColor:InpDownColor;
    if(ObjectFind(0,name)<0) ObjectCreate(0,name,OBJ_RECTANGLE,0,begin,f.lo,finish,f.hi);
@@ -2965,7 +2989,10 @@ void StepLForecast(const int i,const datetime &time[],const double &open[],const
          else if(low[i]<=LF[slot].hi && high[i]>=LF[slot].lo) LF[slot].status="DA CHAM / CHO L";
          continue; // do not replace or move an existing hypothesis on same bar
       }
-      int best=-1,bestScore=-1;
+      // The score depends on side/i, not the pivot: the newest valid pivot wins ties.
+      int bestScore=(int)MathMin(100,LSmartScore(side,i,open,high,low,close,ticks,volume)+15);
+      if(bestScore<InpForecastMinScore) continue;
+      int best=-1;
       for(int p=i-2;p>=MathMax(26,i-InpForecastLookback);p--)
       {
          if(p<=LFUsedPivot[slot]) break;
@@ -2981,21 +3008,38 @@ void StepLForecast(const int i,const datetime &time[],const double &open[],const
          if(gap<0.3*atr || gap>2.5*atr)continue;
          bool broken=false;double departure=0;
          for(int j=p+1;j<=i;j++)
-         { if(side*(close[j]-extreme)<-0.1*atr)broken=true;departure=MathMax(departure,side*(close[j]-extreme)); }
+         {
+            if(side*(close[j]-extreme)<-0.1*atr) { broken=true;break; }
+            departure=MathMax(departure,side*(close[j]-extreme));
+         }
          if(broken || departure<1.0*atr)continue;
-         int points=LSmartScore(side,i,open,high,low,close,ticks,volume);
-         points=(int)MathMin(100,points+15);
-         if(points>=InpForecastMinScore && points>bestScore) {best=p;bestScore=points;}
+         best=p;break;
       }
       if(best<0)continue;
       double extreme=side>0?low[best]:high[best];
       double edge=side>0?MathMin(open[best],close[best]):MathMax(open[best],close[best]);
       double width=MathMax(0.1*atr,MathMin(0.4*atr,MathAbs(edge-extreme)));
+      double lo=side>0?extreme:extreme-width,hi=side>0?extreme+width:extreme;
+      bool confirmed=false;
+      for(int n=NewEventCount-1;n>=0 && NewEvents[n].bar==i;n--)
+         if(NewEvents[n].side==side && NewEvents[n].zoneLow<=hi && NewEvents[n].zoneHigh>=lo)
+         { confirmed=true;break; }
+      LFUsedPivot[slot]=best;
+      if(confirmed) continue; // Do not forecast an L already confirmed on this birth bar.
       LF[slot].active=true;LF[slot].side=side;LF[slot].pivot=best;LF[slot].born=i;
       LF[slot].score=bestScore;LF[slot].atr=atr;LF[slot].lo=side>0?extreme:extreme-width;
       LF[slot].hi=side>0?extreme+width:extreme;LF[slot].stop=extreme-side*InpNewStopBufferATR*atr;
-      LF[slot].status="CHO HOI";LFUsedPivot[slot]=best;
+      LF[slot].status="CHO HOI";
    }
+}
+
+bool SignalMTFReady(const int i,const datetime cutoff)
+{
+   if(i<32 || !InpNewLimitSetup || !InpLLocationMTF || (!InpLLocationEntry && !InpLSellTop) ||
+      (!InpMTFZones && !InpMTFKeyLevels)) return true;
+   for(int tf=0;tf<4;tf++)
+      if(MTFEnabled(tf) && !LoadMTFContext(tf,MTFPeriod(tf),cutoff)) return false;
+   return true;
 }
 
 int CalculateNewEffort(const int count,const int prev,const bool reset,const datetime &time[],
@@ -3005,6 +3049,7 @@ int CalculateNewEffort(const int count,const int prev,const bool reset,const dat
    if(reset)
    {
       ResetNewEffortState();ResetDisplayCache();ResetLForecast();
+      NewReplayPending=true;
       if(Prefix!="") ObjectsDeleteAll(0,Prefix,0,-1);
       ArrayInitialize(Up,EMPTY_VALUE);ArrayInitialize(Down,EMPTY_VALUE);
       ArrayInitialize(ConfirmedBuy,EMPTY_VALUE);ArrayInitialize(ConfirmedSell,EMPTY_VALUE);
@@ -3029,14 +3074,27 @@ int CalculateNewEffort(const int count,const int prev,const bool reset,const dat
       DisplayWickBuy[j]=DisplayWickSell[j]=EMPTY_VALUE;
    }
    if(!InpEnabled) { NewRenderDeferred=false;return count; }
-   NewRenderDeferred=reset;
+   NewRenderDeferred=NewReplayPending;
    int start=MathMax(MathMax(26,InpNewSweepBars+1),NewProcessed+1);
-   if(reset) start=MathMax(start,count-1-InpStartupBars);
+   if(reset)
+   {
+      start=MathMax(start,count-1-InpStartupBars);
+      NewProcessed=MathMin(start-1,count-2); // Preserve the bounded start across history retries.
+   }
+   if(start>=count-1) NewProcessed=count-2; // No eligible closed bar yet; avoid repeating warmup on every tick.
    bool changed=false;
    for(int i=start;i<count-1;i++)
    {
-      for(int route=0;route<7;route++) LGeneratorWhy[route][0]="";
-      bool notify=!reset && i==count-2;
+      // Read required source history before mutating any state for this closed bar.
+      if(!SignalMTFReady(i,time[i]))
+      {
+         if(!MTFHistoryWaiting) Print("C7CB: đang chờ đủ lịch sử MTF; chưa xử lý nến ",TimeToString(time[i]),
+                                     "; kiểm tra lịch sử hoặc tắt nguồn TF chưa đủ dữ liệu.");
+         MTFHistoryWaiting=true;MTFRetryAfter=GetTickCount64()+1000;break;
+      }
+      MTFHistoryWaiting=false;MTFRetryAfter=0;
+      for(int route=0;route<7;route++) for(int slot=0;slot<2;slot++) LGeneratorWhy[route][slot]="";
+      bool notify=!NewReplayPending && i==count-2;
       StepImpulse(i,open,high,low,close,ticks,volume);
       StepPro(i,time,open,high,low,close,ticks,volume);
       StepLTurnContext(i,time,open,high,low,close,ticks,volume);
@@ -3068,15 +3126,20 @@ int CalculateNewEffort(const int count,const int prev,const bool reset,const dat
    }
    bool flush=NewRenderDeferred;
    NewRenderDeferred=false;
-   if(flush && changed)
+   bool caughtUp=NewProcessed==count-2;
+   if(flush && changed && caughtUp)
    {
       int first=InpShowHistory?0:MathMax(0,NewEventCount-5);
       for(int n=first;n<NewEventCount;n++) RenderNewEvent(n);
    }
-   if(changed && InpLForecast) for(int slot=0;slot<2;slot++) DrawLForecast(slot,time,count-2);
+   if(changed && caughtUp && InpLForecast) for(int slot=0;slot<2;slot++) DrawLForecast(slot,time,count-2);
    if(changed && !InpShowHistory) RefreshRecent(count,time,low,high);
-   if(changed) { RenderWyMarks();RefreshLiveLevels(count,time,high,low,close); }
-   RefreshLiveMarketReader(count,time,open,high,low,close,ticks,volume);
+   if(changed && caughtUp) { RenderWyMarks();RefreshLiveLevels(count,time,high,low,close); }
+   if(caughtUp)
+   {
+      NewReplayPending=false;
+      RefreshLiveMarketReader(count,time,open,high,low,close,ticks,volume);
+   }
    return count;
 }
 
@@ -3094,6 +3157,7 @@ int OnCalculate(const int rates_total,const int prev_calculated,
    FirstTime=time[0];
    {
       if(!reset && NewProcessed==rates_total-2) return rates_total;
+      if(!reset && MTFHistoryWaiting && GetTickCount64()<MTFRetryAfter) return rates_total;
       ulong started=GetMicrosecondCount();int before=NewProcessed;
       if(InpEnabled) PrepareMetricCache(rates_total,prev_calculated,reset,high,low,close,tick_volume,volume);
       else if(MetricCacheReady) FreeMetricCache();

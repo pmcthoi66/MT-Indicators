@@ -3,7 +3,7 @@
 //|                 Woodies CCI - Reversal Only                     |
 //+------------------------------------------------------------------+
 #property strict
-#property version   "3.20"
+#property version   "3.21"
 #property indicator_separate_window
 #property indicator_buffers 24
 #property indicator_plots   15
@@ -207,6 +207,8 @@ int g_rsiHandle = INVALID_HANDLE;
 bool g_rsiWaiting = false;
 datetime g_firstBarTime = 0;
 datetime g_openBarTime = 0;
+// Core plots can advance while the RSI-dependent signal suffix is pending.
+int g_signalCalculated = 0;
 
 //==================================================================
 // ALERT STATE
@@ -242,27 +244,31 @@ double CCI(const double &p[],
    // Compensated sums reduce rounding error without rolling-sum drift.
    const double base = p[i];
    double sum = 0.0, correction = 0.0;
-   for(int j = first; j <= i; j++)
+   for(int j = first; j <= i && !_StopFlag; j++)
    {
       double term = (p[j] - base) - correction;
       double next = sum + term;
       correction = (next - sum) - term;
       sum = next;
    }
+   if(_StopFlag) return(EMPTY_VALUE);
    const double mean = sum / period;
    double dev = 0.0;
    correction = 0.0;
-   for(int j = first; j <= i; j++)
+   for(int j = first; j <= i && !_StopFlag; j++)
    {
       double term = MathAbs((p[j] - base) - mean) - correction;
       double next = dev + term;
       correction = (next - dev) - term;
       dev = next;
    }
+   if(_StopFlag) return(EMPTY_VALUE);
    dev /= period;
    if(dev <= 0.0)
       return(0.0);
-   double value = -mean / (0.015 * dev);
+   double denominator = 0.015 * dev;
+   // Retain the usual rounding; avoid zero division for subnormal data.
+   double value = denominator > 0.0 ? -mean / denominator : (-mean / dev) / 0.015;
    return(MathIsValidNumber(value) ? value : EMPTY_VALUE);
 }
 
@@ -277,7 +283,7 @@ double CCI(const double &p[],
 //==================================================================
 void CalculateHistogram(const int rates_total, const int start)
 {
-   for(int i = start; i < rates_total; i++)
+   for(int i = start; i < rates_total && !_StopFlag; i++)
    {
       HistDarkGreenBuffer[i] = EMPTY_VALUE;
       HistMaroonBuffer[i] = EMPTY_VALUE;
@@ -424,12 +430,13 @@ double RSIRegressionSlope(const int i, const int bars = 0)
    double numerator = 0.0;
    double base = RSIFilterBuffer[first];
    if(!ValidRSIFilterValue(base)) return(EMPTY_VALUE);
-   for(int k = 0; k < n; k++)
+   for(int k = 0; k < n && !_StopFlag; k++)
    {
       double value = RSIFilterBuffer[first+k];
       if(!ValidRSIFilterValue(value)) return(EMPTY_VALUE);
       numerator += ((double)k - meanX) * (value - base);
    }
+   if(_StopFlag) return(EMPTY_VALUE);
    double size = (double)n;
    double denominator = size * (size * size - 1.0) / 12.0;
    double slope = numerator / denominator;
@@ -477,10 +484,17 @@ bool LoadRSIFilter(const int rates_total, const int start)
    if(g_rsiHandle == INVALID_HANDLE || BarsCalculated(g_rsiHandle) < rates_total)
       return(false);
    if(CopyBuffer(g_rsiHandle, 0, 0, count, RSICopy) != count) return(false);
-   for(int i = start; i < rates_total; i++)
+   // A successful copy can still contain uncalculated samples. Do not advance
+   // the signal cursor until every needed closed/live RSI sample is valid.
+   // The unfinished candle is not required by closed-bar signals.
+   int lastNeeded = rates_total - (InpClosedBarsOnly ? 2 : 1);
+   for(int i = MathMax(start, InpRSIPeriod); i <= lastNeeded && !_StopFlag; i++)
+      if(!ValidRSIFilterValue(RSICopy[i-start])) return(false);
+   if(_StopFlag) return(false);
+   for(int i = start; i < rates_total && !_StopFlag; i++)
       RSIFilterBuffer[i] = i >= InpRSIPeriod && ValidRSIFilterValue(RSICopy[i-start])
                            ? RSICopy[i-start] : EMPTY_VALUE;
-   return(true);
+   return(!_StopFlag);
 }
 
 // These coordinates are display positions, not CCI measurements.
@@ -517,12 +531,14 @@ void CalculateSignals(const int rates_total, const int start)
 {
    const int firstSignal = MathMax(InpCCIPeriod, InpTCCIPeriod);
    const int last = rates_total - (InpClosedBarsOnly ? 2 : 1);
-   for(int i = start; i < rates_total; i++)
+   for(int i = start; i < rates_total && !_StopFlag; i++)
    {
       SellSignalBuffer[i] = EMPTY_VALUE;
       BuySignalBuffer[i] = EMPTY_VALUE;
       SellConfirmBuffer[i] = EMPTY_VALUE;
       BuyConfirmBuffer[i] = EMPTY_VALUE;
+      RSITrendBuffer[i] = EMPTY_VALUE;
+      RSIShortTrendBuffer[i] = EMPTY_VALUE;
       // Distances, rather than absolute indices, survive history shifts.
       double buyAge = i > 0 ? MathMin((double)InpSignalCooldown, BuyAgeBuffer[i-1] + 1.0) : InpSignalCooldown;
       double sellAge = i > 0 ? MathMin((double)InpSignalCooldown, SellAgeBuffer[i-1] + 1.0) : InpSignalCooldown;
@@ -541,10 +557,26 @@ void CalculateSignals(const int rates_total, const int start)
       }
       if(i >= firstSignal && i <= last)
       {
-         bool buy = IsReversalBuy(i) && PassRSIFilter(i, true) && PassTurboTurn(i, true) && PassHistogram(i, true) &&
+         // Cheap gates precede regression. The opposite CCI extremes make
+         // BUY and SELL candidates mutually exclusive for a positive level.
+         bool buy = buyAge >= InpSignalCooldown && IsReversalBuy(i) &&
+                    PassTurboTurn(i, true) && PassHistogram(i, true) &&
                     (!InpOneSignalPerExtreme || buyUsed == 0.0);
-         bool sell = IsReversalSell(i) && PassRSIFilter(i, false) && PassTurboTurn(i, false) && PassHistogram(i, false) &&
+         bool sell = sellAge >= InpSignalCooldown && IsReversalSell(i) &&
+                     PassTurboTurn(i, false) && PassHistogram(i, false) &&
                      (!InpOneSignalPerExtreme || sellUsed == 0.0);
+         if((buy || sell) && InpUseRSIFilter && InpUseRSIRegression)
+         {
+            RSITrendBuffer[i] = RSIRegressionSlope(i);
+            double slope = RSITrendBuffer[i];
+            bool againstLong = Valid(slope) &&
+                               (buy ? slope < -InpRSISlopeDeadband : slope > InpRSISlopeDeadband);
+            if(againstLong && InpAllowRSIShortTurn)
+               RSIShortTrendBuffer[i] = RSIRegressionSlope(i, InpRSIShortSlopeBars);
+         }
+         if(_StopFlag) return;
+         buy = buy && PassRSIFilter(i, true);
+         sell = sell && PassRSIFilter(i, false);
          if(buy && !sell && buyAge >= InpSignalCooldown)
          {
             BuySignalBuffer[i] = SignalPosition(i, true);
@@ -666,6 +698,7 @@ int OnInit()
       !MathIsValidNumber(InpLower200) || !MathIsValidNumber(InpLower100) ||
       !MathIsValidNumber(InpZeroLevel) || !MathIsValidNumber(InpUpper100) ||
       !MathIsValidNumber(InpUpper200) || InpScaleMin >= InpScaleMax ||
+      !MathIsValidNumber(InpScaleMax - InpScaleMin) ||
       !(InpLower200 < InpLower100 && InpLower100 < InpZeroLevel &&
         InpZeroLevel < InpUpper100 && InpUpper100 < InpUpper200))
    {
@@ -674,20 +707,11 @@ int OnInit()
    }
    g_rsiHandle = INVALID_HANDLE;
    g_rsiWaiting = false;
-   if(InpUseRSIFilter)
-   {
-      g_rsiHandle = iRSI(_Symbol, _Period, InpRSIPeriod, InpRSIPrice);
-      if(g_rsiHandle == INVALID_HANDLE)
-      {
-         Print("Woodies CCI: cannot create RSI handle. Error: ", GetLastError());
-         return(INIT_FAILED);
-      }
-   }
-   SetIndexBuffer(23, RSIShortTrendBuffer, INDICATOR_CALCULATIONS);
+   if(!SetIndexBuffer(23, RSIShortTrendBuffer, INDICATOR_CALCULATIONS)) return(INIT_FAILED);
    ArraySetAsSeries(RSIShortTrendBuffer, false);
-   SetIndexBuffer(22, RSITrendBuffer, INDICATOR_CALCULATIONS);
+   if(!SetIndexBuffer(22, RSITrendBuffer, INDICATOR_CALCULATIONS)) return(INIT_FAILED);
    ArraySetAsSeries(RSITrendBuffer, false);
-   SetIndexBuffer(21, RSIFilterBuffer, INDICATOR_CALCULATIONS);
+   if(!SetIndexBuffer(21, RSIFilterBuffer, INDICATOR_CALCULATIONS)) return(INIT_FAILED);
    ArraySetAsSeries(RSIFilterBuffer, false);
    ArraySetAsSeries(RSICopy, false);
    g_alertInitialized = false;
@@ -695,12 +719,13 @@ int OnInit()
    g_lastAlertType = 0;
    g_firstBarTime = 0;
    g_openBarTime = 0;
-   SetIndexBuffer(15, Price, INDICATOR_CALCULATIONS);
-   SetIndexBuffer(16, RunBuffer, INDICATOR_CALCULATIONS);
-   SetIndexBuffer(17, BuyAgeBuffer, INDICATOR_CALCULATIONS);
-   SetIndexBuffer(18, SellAgeBuffer, INDICATOR_CALCULATIONS);
-   SetIndexBuffer(19, BuyUsedBuffer, INDICATOR_CALCULATIONS);
-   SetIndexBuffer(20, SellUsedBuffer, INDICATOR_CALCULATIONS);
+   g_signalCalculated = 0;
+   if(!SetIndexBuffer(15, Price, INDICATOR_CALCULATIONS)) return(INIT_FAILED);
+   if(!SetIndexBuffer(16, RunBuffer, INDICATOR_CALCULATIONS)) return(INIT_FAILED);
+   if(!SetIndexBuffer(17, BuyAgeBuffer, INDICATOR_CALCULATIONS)) return(INIT_FAILED);
+   if(!SetIndexBuffer(18, SellAgeBuffer, INDICATOR_CALCULATIONS)) return(INIT_FAILED);
+   if(!SetIndexBuffer(19, BuyUsedBuffer, INDICATOR_CALCULATIONS)) return(INIT_FAILED);
+   if(!SetIndexBuffer(20, SellUsedBuffer, INDICATOR_CALCULATIONS)) return(INIT_FAILED);
    ArraySetAsSeries(BuyUsedBuffer, false);
    ArraySetAsSeries(SellUsedBuffer, false);
    ArraySetAsSeries(Price, false);
@@ -710,34 +735,34 @@ int OnInit()
    //===============================================================
    // Histogram buffers
    //===============================================================
-   SetIndexBuffer(0, HistDarkGreenBuffer, INDICATOR_DATA);
-   SetIndexBuffer(1, HistMaroonBuffer,    INDICATOR_DATA);
-   SetIndexBuffer(2, HistGrayBuffer,      INDICATOR_DATA);
-   SetIndexBuffer(3, HistYellowBuffer,    INDICATOR_DATA);
+   if(!SetIndexBuffer(0, HistDarkGreenBuffer, INDICATOR_DATA)) return(INIT_FAILED);
+   if(!SetIndexBuffer(1, HistMaroonBuffer, INDICATOR_DATA)) return(INIT_FAILED);
+   if(!SetIndexBuffer(2, HistGrayBuffer, INDICATOR_DATA)) return(INIT_FAILED);
+   if(!SetIndexBuffer(3, HistYellowBuffer, INDICATOR_DATA)) return(INIT_FAILED);
 
    //===============================================================
    // CCI buffers
    //===============================================================
-   SetIndexBuffer(4, CCIBuffer,  INDICATOR_DATA);
-   SetIndexBuffer(5, TCCIBuffer, INDICATOR_DATA);
+   if(!SetIndexBuffer(4, CCIBuffer, INDICATOR_DATA)) return(INIT_FAILED);
+   if(!SetIndexBuffer(5, TCCIBuffer, INDICATOR_DATA)) return(INIT_FAILED);
 
    //===============================================================
    // Level buffers
    //===============================================================
-   SetIndexBuffer(6,  ZeroLineBuffer, INDICATOR_DATA);
-   SetIndexBuffer(7,  Upper100Buffer, INDICATOR_DATA);
-   SetIndexBuffer(8,  Lower100Buffer, INDICATOR_DATA);
-   SetIndexBuffer(9,  Upper200Buffer, INDICATOR_DATA);
-   SetIndexBuffer(10, Lower200Buffer, INDICATOR_DATA);
+   if(!SetIndexBuffer(6, ZeroLineBuffer, INDICATOR_DATA)) return(INIT_FAILED);
+   if(!SetIndexBuffer(7, Upper100Buffer, INDICATOR_DATA)) return(INIT_FAILED);
+   if(!SetIndexBuffer(8, Lower100Buffer, INDICATOR_DATA)) return(INIT_FAILED);
+   if(!SetIndexBuffer(9, Upper200Buffer, INDICATOR_DATA)) return(INIT_FAILED);
+   if(!SetIndexBuffer(10, Lower200Buffer, INDICATOR_DATA)) return(INIT_FAILED);
 
    //===============================================================
    // Signal buffers
    //===============================================================
-   SetIndexBuffer(11, SellSignalBuffer, INDICATOR_DATA);
-   SetIndexBuffer(12, BuySignalBuffer,  INDICATOR_DATA);
+   if(!SetIndexBuffer(11, SellSignalBuffer, INDICATOR_DATA)) return(INIT_FAILED);
+   if(!SetIndexBuffer(12, BuySignalBuffer, INDICATOR_DATA)) return(INIT_FAILED);
 
-   SetIndexBuffer(13, SellConfirmBuffer, INDICATOR_DATA);
-   SetIndexBuffer(14, BuyConfirmBuffer, INDICATOR_DATA);
+   if(!SetIndexBuffer(13, SellConfirmBuffer, INDICATOR_DATA)) return(INIT_FAILED);
+   if(!SetIndexBuffer(14, BuyConfirmBuffer, INDICATOR_DATA)) return(INIT_FAILED);
    ArraySetAsSeries(SellConfirmBuffer, false);
    ArraySetAsSeries(BuyConfirmBuffer, false);
    //===============================================================
@@ -759,6 +784,17 @@ int OnInit()
 
    ArraySetAsSeries(SellSignalBuffer, false);
    ArraySetAsSeries(BuySignalBuffer,  false);
+
+   // Bindings cannot leave a newly created RSI handle behind on failure.
+   if(InpUseRSIFilter)
+   {
+      g_rsiHandle = iRSI(_Symbol, _Period, InpRSIPeriod, InpRSIPrice);
+      if(g_rsiHandle == INVALID_HANDLE)
+      {
+         Print("Woodies CCI: cannot create RSI handle. Error: ", GetLastError());
+         return(INIT_FAILED);
+      }
+   }
 
    //===============================================================
    // Arrow codes
@@ -833,7 +869,7 @@ int OnInit()
    //===============================================================
    IndicatorSetString(
       INDICATOR_SHORTNAME,
-      "Woodies CCI V3.2 - RSI Trend " + IntegerToString(InpRSISlopeBars) + "/" + IntegerToString(InpRSIShortSlopeBars)
+      "Woodies CCI V3.21 - RSI Trend " + IntegerToString(InpRSISlopeBars) + "/" + IntegerToString(InpRSIShortSlopeBars)
    );
 
    PlotIndexSetString(4, PLOT_LABEL, "CCI " + IntegerToString(InpCCIPeriod));
@@ -876,7 +912,7 @@ int OnCalculate(
    const long &volume[],
    const int &spread[])
 {
-   if(rates_total <= 0) return(0);
+   if(rates_total <= 0 || _StopFlag) return(0);
    ArraySetAsSeries(time, false);
    ArraySetAsSeries(high, false);
    ArraySetAsSeries(low, false);
@@ -887,12 +923,44 @@ int OnCalculate(
                 g_firstBarTime != time[0] ||
                 (prev_calculated == rates_total && g_openBarTime != time[rates_total-1]);
    int start = reset ? 0 : MathMax(0, prev_calculated - 1);
-   if(reset) g_alertInitialized = false;
-   // Never generate an unfiltered signal while RSI data is incomplete.
-   // Do not commit the calculation cursor, so the suffix is retried.
-   if(!LoadRSIFilter(rates_total, start))
+   if(reset)
    {
-      for(int i = start; i < rates_total; i++)
+      g_alertInitialized = false;
+      g_signalCalculated = 0;
+   }
+   int signalStart = MathMax(0, MathMin(prev_calculated, g_signalCalculated) - 1);
+   // Core plots do not depend on RSI availability. A separate signal cursor
+   // retains the missing suffix without recalculating the whole CCI history.
+   for(int i = start; i < rates_total && !_StopFlag; i++)
+   {
+      // Algebraically equivalent typical price, with smaller intermediates.
+      Price[i] = close[i] + ((high[i] - close[i]) + (low[i] - close[i])) / 3.0;
+      CCIBuffer[i] = CCI(Price, i, InpCCIPeriod);
+      TCCIBuffer[i] = InpTCCIPeriod == InpCCIPeriod ? CCIBuffer[i] : CCI(Price, i, InpTCCIPeriod);
+      ZeroLineBuffer[i] = InpZeroLevel;
+      Upper100Buffer[i] = InpUpper100;
+      Lower100Buffer[i] = InpLower100;
+      Upper200Buffer[i] = InpUpper200;
+      Lower200Buffer[i] = InpLower200;
+   }
+   if(_StopFlag) return(0);
+   CalculateHistogram(rates_total, start);
+   if(_StopFlag) return(0);
+   g_firstBarTime = time[0];
+   g_openBarTime = time[rates_total-1];
+
+   // In closed-bar mode, an ordinary tick cannot change a signal. RSI is
+   // loaded again on the next new bar, or while a missing suffix is pending.
+   if(!reset && InpClosedBarsOnly && prev_calculated == rates_total &&
+      g_signalCalculated == rates_total && !g_rsiWaiting)
+   {
+      CalculateSignals(rates_total, rates_total-1);
+      return(_StopFlag ? 0 : rates_total);
+   }
+   if(!LoadRSIFilter(rates_total, signalStart))
+   {
+      if(_StopFlag) return(0);
+      for(int i = start; i < rates_total && !_StopFlag; i++)
       {
          BuySignalBuffer[i] = EMPTY_VALUE;
          SellSignalBuffer[i] = EMPTY_VALUE;
@@ -902,39 +970,20 @@ int OnCalculate(
          RSITrendBuffer[i] = EMPTY_VALUE;
          RSIShortTrendBuffer[i] = EMPTY_VALUE;
       }
+      if(_StopFlag) return(0);
       if(!g_rsiWaiting)
          Print("Woodies CCI: waiting for RSI data; signals temporarily blocked.");
       g_rsiWaiting = true;
-      return(reset ? 0 : prev_calculated);
+      return(rates_total);
    }
    g_rsiWaiting = false;
-   for(int i = start; i < rates_total; i++)
-   {
-      RSITrendBuffer[i] = InpUseRSIFilter && InpUseRSIRegression
-                          ? RSIRegressionSlope(i) : EMPTY_VALUE;
-      RSIShortTrendBuffer[i] = InpUseRSIFilter && InpUseRSIRegression && InpAllowRSIShortTurn
-                               ? RSIRegressionSlope(i, InpRSIShortSlopeBars) : EMPTY_VALUE;
-   }
-   for(int i = start; i < rates_total; i++)
-   {
-      // Algebraically equivalent typical price, with smaller intermediates.
-      Price[i] = close[i] + ((high[i] - close[i]) + (low[i] - close[i])) / 3.0;
-      CCIBuffer[i] = CCI(Price, i, InpCCIPeriod);
-      TCCIBuffer[i] = CCI(Price, i, InpTCCIPeriod);
-      ZeroLineBuffer[i] = InpZeroLevel;
-      Upper100Buffer[i] = InpUpper100;
-      Lower100Buffer[i] = InpLower100;
-      Upper200Buffer[i] = InpUpper200;
-      Lower200Buffer[i] = InpLower200;
-   }
-   CalculateHistogram(rates_total, start);
-   CalculateSignals(rates_total, start);
+   CalculateSignals(rates_total, signalStart);
+   if(_StopFlag) return(0);
+   g_signalCalculated = rates_total;
    // Do not prime alerts until both the signal candle and its predecessor exist.
    int signalBar = rates_total - (InpClosedBarsOnly ? 2 : 1);
    if(signalBar >= MathMax(InpCCIPeriod, InpTCCIPeriod))
       CheckM5SignalAlert(rates_total, time);
-   g_firstBarTime = time[0];
-   g_openBarTime = time[rates_total-1];
    return(rates_total);
 }
 //+------------------------------------------------------------------+

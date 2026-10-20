@@ -1,14 +1,14 @@
 //+------------------------------------------------------------------+
-//|                    VA_EL_V1 v1.29 - Volume Core                 |
+//|                    VA_EL_V1 v1.30 - Volume Core                 |
 //|      Volume histogram and average only.  |
 //+------------------------------------------------------------------+
 #property copyright "VE Pro), 2026"
 #property link      "cdm.thoigmail.com"
-#property version   "1.29"
+#property version   "1.30"
 #property strict
 #property indicator_separate_window
-#property indicator_buffers 5
-#property indicator_plots   2
+#property indicator_buffers 6
+#property indicator_plots   3
 #property indicator_minimum 0
 
 #property indicator_label1  "Volume"
@@ -21,6 +21,9 @@
 #property indicator_color2  clrGray
 #property indicator_width2  1
 
+#property indicator_label3  "Relative volume (prior MA)"
+#property indicator_type3   DRAW_NONE
+
 enum enMaTypes
   {
    ma_sma,   // SMA
@@ -32,7 +35,7 @@ enum enMaTypes
 enum enVolumeType
   {
    vol_ticks, // Tick volume
-   vol_volume // Real volume; falls back to tick volume if unavailable
+   vol_volume // Real volume for the series; tick fallback if all real data is zero
   };
 
 input group "Volume Core"
@@ -42,6 +45,7 @@ input int          inpAveragePeriod = 20;         // Volume average period
 input enMaTypes    inpAverageMethod = ma_sma;     // Average method
 input bool         inpShowAverage   = true;       // Show volume average line
 input bool         inpClosedColorsOnly = true;    // Use neutral color until bar closes
+input bool         inpRequireFullPeriod = true;   // Wait for a full prior MA before classification
 
 input group "Volume thresholds (multiple of prior MA)"
 input double inpLowVolStartRatio      = 0.5; // Low tier begins
@@ -67,19 +71,26 @@ input color inpExtremeVolumeColor = clrPurple; // Kept distinct from directional
 double BufferVolume[];
 double BufferColorIndex[];
 double BufferAverage[];
+double BufferRelativeVolume[];
 double BufferRollingSum[];
 double BufferRollingWeighted[];
+datetime FirstBarTime=0;
+bool UsingRealVolume=false;
+int LatestRealVolumeBar=-1;
 
 double ReadVolume(const int i,const long &tick_volume[],const long &real_volume[])
   {
-   if(inpVolumeType==vol_volume && real_volume[i]>0)
-      return((double)real_volume[i]);
-   return((double)tick_volume[i]);
+   // Keep one unit throughout the MA. A zero real-volume bar is not tick volume.
+   return(MathMax(0.0,(double)(UsingRealVolume ? real_volume[i] : tick_volume[i])));
   }
 
 int OnInit()
   {
-   if(inpAveragePeriod<1 ||
+   if(inpAveragePeriod<1 || inpAverageMethod<ma_sma || inpAverageMethod>ma_lwma ||
+      inpVolumeType<vol_ticks || inpVolumeType>vol_volume ||
+      !MathIsValidNumber(inpLowVolStartRatio) || !MathIsValidNumber(inpMediumVolStartRatio) ||
+      !MathIsValidNumber(inpHighVolStartRatio) || !MathIsValidNumber(inpVeryHighVolStartRatio) ||
+      !MathIsValidNumber(inpAbnormalVolumeRatio) ||
       inpLowVolStartRatio<=0 ||
       inpMediumVolStartRatio<=inpLowVolStartRatio ||
       inpHighVolStartRatio<=inpMediumVolStartRatio ||
@@ -87,17 +98,21 @@ int OnInit()
       inpAbnormalVolumeRatio<=inpVeryHighVolStartRatio)
       return(INIT_PARAMETERS_INCORRECT);
 
-   SetIndexBuffer(0,BufferVolume,INDICATOR_DATA);
-   SetIndexBuffer(1,BufferColorIndex,INDICATOR_COLOR_INDEX);
-   SetIndexBuffer(2,BufferAverage,INDICATOR_DATA);
-   SetIndexBuffer(3,BufferRollingSum,INDICATOR_CALCULATIONS);
-   SetIndexBuffer(4,BufferRollingWeighted,INDICATOR_CALCULATIONS);
+   if(!SetIndexBuffer(0,BufferVolume,INDICATOR_DATA) ||
+      !SetIndexBuffer(1,BufferColorIndex,INDICATOR_COLOR_INDEX) ||
+      !SetIndexBuffer(2,BufferAverage,INDICATOR_DATA) ||
+      !SetIndexBuffer(3,BufferRelativeVolume,INDICATOR_DATA) ||
+      !SetIndexBuffer(4,BufferRollingSum,INDICATOR_CALCULATIONS) ||
+      !SetIndexBuffer(5,BufferRollingWeighted,INDICATOR_CALCULATIONS))
+      return(INIT_FAILED);
 
    ArraySetAsSeries(BufferVolume,false);
    ArraySetAsSeries(BufferColorIndex,false);
    ArraySetAsSeries(BufferAverage,false);
+   ArraySetAsSeries(BufferRelativeVolume,false);
    ArraySetAsSeries(BufferRollingSum,false);
    ArraySetAsSeries(BufferRollingWeighted,false);
+   FirstBarTime=0;UsingRealVolume=false;LatestRealVolumeBar=-1;
 
    PlotIndexSetInteger(0,PLOT_COLOR_INDEXES,12);
    PlotIndexSetInteger(0,PLOT_LINE_COLOR,0,inpNeutralColor);
@@ -115,9 +130,13 @@ int OnInit()
    PlotIndexSetInteger(1,PLOT_DRAW_TYPE,inpShowAverage ? DRAW_LINE : DRAW_NONE);
    PlotIndexSetDouble(0,PLOT_EMPTY_VALUE,EMPTY_VALUE);
    PlotIndexSetDouble(1,PLOT_EMPTY_VALUE,EMPTY_VALUE);
+   PlotIndexSetDouble(2,PLOT_EMPTY_VALUE,EMPTY_VALUE);
+   PlotIndexSetInteger(2,PLOT_SHOW_DATA,true);
    PlotIndexSetString(0,PLOT_LABEL,"Volume");
    PlotIndexSetString(1,PLOT_LABEL,"Volume MA");
-   IndicatorSetString(INDICATOR_SHORTNAME,"VA_EL_V1 v1.29 Volume Core");
+   PlotIndexSetString(2,PLOT_LABEL,"Relative volume (prior MA)");
+   IndicatorSetInteger(INDICATOR_DIGITS,2);
+   IndicatorSetString(INDICATOR_SHORTNAME,"VA_EL_V1 v1.30 Volume Core");
    return(INIT_SUCCEEDED);
   }
 
@@ -141,7 +160,7 @@ int OnCalculate(const int rates_total,
                 const long &real_volume[],
                 const int &spread[])
   {
-   if(rates_total<1) return(0);
+   if(rates_total<1 || _StopFlag) return(0);
 
    ArraySetAsSeries(time,false);
    ArraySetAsSeries(open,false);
@@ -149,22 +168,55 @@ int OnCalculate(const int rates_total,
    ArraySetAsSeries(tick_volume,false);
    ArraySetAsSeries(real_volume,false);
 
+   bool reset=prev_calculated<=0 || prev_calculated>rates_total || FirstBarTime!=time[0];
+   FirstBarTime=time[0];
+   int start=reset ? 0 : prev_calculated-1;
+   int processed=start;
    if(!inpEnabled)
      {
-      if(prev_calculated==0)
-         for(int i=0;i<rates_total;++i)
-           {
-            BufferVolume[i]=EMPTY_VALUE;
-            BufferColorIndex[i]=0;
-            BufferAverage[i]=EMPTY_VALUE;
-            BufferRollingSum[i]=0;
-            BufferRollingWeighted[i]=0;
-           }
-      return(rates_total);
+      for(int i=start;i<rates_total && !_StopFlag;++i)
+        {
+         BufferVolume[i]=EMPTY_VALUE;
+         BufferColorIndex[i]=0;
+         BufferAverage[i]=EMPTY_VALUE;
+         BufferRelativeVolume[i]=EMPTY_VALUE;
+         BufferRollingSum[i]=0;
+         BufferRollingWeighted[i]=0;
+         processed=i+1;
+        }
+      return(processed);
      }
 
-   int start=(prev_calculated>0 ? prev_calculated-1 : 0);
-   if(start>=rates_total) start=0;
+   int latestReal=(reset ? -1 : LatestRealVolumeBar);
+   int scanStart=start;
+   if(latestReal>=0 && (latestReal>=rates_total || real_volume[latestReal]<=0))
+     {
+      // A feed correction may remove the last positive real-volume sample.
+      latestReal=-1;
+      scanStart=0;
+     }
+   if(inpVolumeType==vol_volume)
+     {
+      for(int i=rates_total-1;i>=scanStart && !_StopFlag;--i)
+         if(real_volume[i]>0) { latestReal=i;break; }
+     }
+   else
+      latestReal=-1;
+   if(_StopFlag) return(0);
+   LatestRealVolumeBar=latestReal;
+   bool realAvailable=latestReal>=0;
+   if(reset || realAvailable!=UsingRealVolume)
+     {
+      UsingRealVolume=realAvailable;
+      start=0; // Switching units requires rebuilding every dependent MA/color.
+      if(inpVolumeType==vol_ticks)
+         IndicatorSetString(INDICATOR_SHORTNAME,"VA_EL_V1 v1.30 Volume Core - Tick");
+      else if(UsingRealVolume)
+         IndicatorSetString(INDICATOR_SHORTNAME,"VA_EL_V1 v1.30 Volume Core - Real");
+      else
+         IndicatorSetString(INDICATOR_SHORTNAME,"VA_EL_V1 v1.30 Volume Core - Tick fallback");
+     }
+   processed=start;
    const double alpha=2.0/(inpAveragePeriod+1.0);
 
    for(int i=start;i<rates_total && !_StopFlag;++i)
@@ -180,6 +232,14 @@ int OnCalculate(const int rates_total,
       else
          BufferRollingSum[i]=BufferRollingSum[i-1]+vol-BufferVolume[i-inpAveragePeriod];
 
+      // O(1) weighted update during warmup as well as after the full window.
+      if(i==0)
+         BufferRollingWeighted[i]=vol;
+      else if(i<inpAveragePeriod)
+         BufferRollingWeighted[i]=BufferRollingWeighted[i-1]+(i+1.0)*vol;
+      else
+         BufferRollingWeighted[i]=BufferRollingWeighted[i-1]-BufferRollingSum[i-1]+inpAveragePeriod*vol;
+
       double average=0.0;
       if(inpAverageMethod==ma_sma)
          average=BufferRollingSum[i]/count;
@@ -194,32 +254,8 @@ int OnCalculate(const int rates_total,
          else
             average=BufferAverage[i-1]+(vol-BufferAverage[i-1])/inpAveragePeriod;
         }
-      else // LWMA: rolling weighted sum after the initial window
-        {
-         double weighted=0.0;
-         if(i<inpAveragePeriod)
-           {
-            for(int j=0;j<=i;++j)
-               weighted+=BufferVolume[i-j]*(i-j+1);
-           }
-         else
-            weighted=BufferRollingWeighted[i-1]-BufferRollingSum[i-1]+inpAveragePeriod*vol;
-         BufferRollingWeighted[i]=weighted;
-         average=weighted/(count*(count+1.0)/2.0);
-        }
-
-      if(inpAverageMethod!=ma_lwma)
-        {
-         double weighted=0.0;
-         if(i<inpAveragePeriod)
-           {
-            for(int j=0;j<=i;++j)
-               weighted+=BufferVolume[i-j]*(i-j+1);
-           }
-         else
-            weighted=BufferRollingWeighted[i-1]-BufferRollingSum[i-1]+inpAveragePeriod*vol;
-         BufferRollingWeighted[i]=weighted;
-        }
+      else
+         average=BufferRollingWeighted[i]/(count*(count+1.0)/2.0);
 
       BufferAverage[i]=average;
       if(!MathIsValidNumber(average) || average<0)
@@ -228,9 +264,13 @@ int OnCalculate(const int rates_total,
       int colorIndex=0;
       bool barMayBeColored=(!inpClosedColorsOnly || i<rates_total-1);
       double priorAverage=(i>0 ? BufferAverage[i-1] : 0.0);
-      if(barMayBeColored && priorAverage>0.0 && vol>0.0)
+      bool baselineReady=(!inpRequireFullPeriod || i>=inpAveragePeriod) && priorAverage>0.0;
+      double relativeVolume=(baselineReady ? vol/priorAverage : 0.0);
+      // A tiny EMA after a long zero run can overflow the ratio. Keep its
+      // extreme classification, but never publish infinity in the Data Window.
+      BufferRelativeVolume[i]=(baselineReady && MathIsValidNumber(relativeVolume) ? relativeVolume : EMPTY_VALUE);
+      if(barMayBeColored && baselineReady && vol>0.0)
         {
-         double relativeVolume=vol/priorAverage;
          if(relativeVolume>=inpAbnormalVolumeRatio)
             colorIndex=11;
          else if(close[i]>open[i])
@@ -239,7 +279,8 @@ int OnCalculate(const int rates_total,
             colorIndex=5+VolumeTier(relativeVolume);
         }
       BufferColorIndex[i]=colorIndex;
+      processed=i+1;
      }
 
-   return(rates_total);
+   return(processed);
   }
