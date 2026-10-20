@@ -18,6 +18,7 @@ ADAPTER = r'''
 #include <cmath>
 #include <ctime>
 #include <iostream>
+#include <climits>
 #include <limits>
 #include <map>
 #include <numeric>
@@ -118,10 +119,13 @@ datetime stamp(int year,int month,int day,int hour=0,int minute=0,int second=0) 
 struct Series {
  std::vector<datetime> opens;
  std::vector<double> rsi;
- int calculated=-1,timeShortfall=0,valueShortfall=0,lag=0;
+ int calculated=-1,timeShortfall=0,valueShortfall=0,lag=0,readableRecent=-1;
  bool rollOnTimeCopy=false;
 };
-struct Handle {ENUM_TIMEFRAMES tf;bool movingAverage;int input;};
+struct Handle {
+ ENUM_TIMEFRAMES tf;bool movingAverage;int input;
+ int reportedCount=INT_MIN,readableRecent=-1;
+};
 std::map<ENUM_TIMEFRAMES,Series> sources;
 std::map<int,Handle> handles;
 std::set<int> released;
@@ -157,7 +161,13 @@ int iBarShift(const string&,ENUM_TIMEFRAMES tf,datetime endpoint,bool exact) {
 }
 int BarsCalculated(int h) {
  if(!handles.count(h) || released.count(h))return -1;
+ if(handles[h].reportedCount!=INT_MIN)return handles[h].reportedCount;
  const auto& a=sources[handles[h].tf];return a.calculated<0?int(a.opens.size()):a.calculated;
+}
+int readableFirst(int h) {
+ const auto& handle=handles.at(h);const auto& source=sources.at(handle.tf);
+ int count=handle.readableRecent>=0?handle.readableRecent:source.readableRecent;
+ return count<0?0:std::max(0,int(source.opens.size())-count);
 }
 double nativeValue(int h,int ascendingIndex) {
  const auto& handle=handles.at(h);const auto& a=sources.at(handle.tf);
@@ -185,7 +195,8 @@ int CopyTime(const string&,ENUM_TIMEFRAMES tf,int shift,int count,Array<datetime
 int CopyBuffer(int h,int,int shift,int count,Array<double>& target) {
  ++copyCalls;++handleCopies[h];maxCopyRequest=std::max(maxCopyRequest,count);
  auto& a=sources[handles.at(h).tf];int end=int(a.opens.size())-shift-a.lag;
- int start=std::max(0,end-count),actual=std::max(0,end-start-a.valueShortfall);
+ int start=std::max(readableFirst(h),std::max(0,end-count));
+ int actual=std::max(0,end-start-a.valueShortfall);
  target.resize(actual);for(int i=0;i<actual;i++)target.physical(i)=nativeValue(h,start+i);
  return actual;
 }
@@ -194,6 +205,7 @@ int CopyBuffer(int h,int,datetime begin,datetime end,Array<double>& target) {
  int first=std::lower_bound(a.opens.begin(),a.opens.end(),begin)-a.opens.begin();
  int stop=std::upper_bound(a.opens.begin(),a.opens.end(),end)-a.opens.begin();
  maxCopyRequest=std::max(maxCopyRequest,stop-first);
+ first=std::max(first,readableFirst(h));
  stop=std::min(stop,int(a.opens.size())-a.lag);stop=std::max(first,stop-a.valueShortfall);
  int count=std::max(0,stop-first);target.resize(count);
  for(int i=0;i<count;i++)target.physical(i)=nativeValue(h,first+i);
@@ -397,15 +409,15 @@ void causalHistory() {
 void pendingAndLimitedHistory() {
  resetHarness();start();Chart d(stamp(2026,1,1),100);
  serverNow=d.newest()+1800;coverAll(d.oldest(),serverNow);
- sources[TF[2]].calculated=int(sources[TF[2]].opens.size())-1;
+ sources[TF[2]].calculated=0;sources[TF[2]].readableRecent=0;
  require(d.calculate(0)==100,"one pending TF must not reset chart cursor");
  require(Pending[2]>0 && Pending[0]==0,"each TF needs independent pending state");
  parity(d,0);parity(d,1);parity(d,3);parity(d,4);
- int pendingCopies=handleCopies[Handles[2]],goodCopies=handleCopies[Handles[0]];
+ int goodCopies=handleCopies[Handles[0]];maxCopyRequest=0;
  milliseconds+=50;d.calculate(100);
- require(handleCopies[Handles[2]]==pendingCopies,"retry throttle must avoid repeated failing copy");
+ require(maxCopyRequest<=8,"pending historical replay must be throttled while current points still refresh");
  require(handleCopies[Handles[0]]>goodCopies,"good line must update during another TF's wait");
- sources[TF[2]].calculated=-1;milliseconds+=300;d.calculate(100);parity(d);
+ sources[TF[2]].calculated=-1;sources[TF[2]].readableRecent=-1;milliseconds+=1100;d.calculate(100);parity(d);
  require(Pending[2]==0,"ready TF must replay missed suffix");
  auto& limited=sources[TF[0]];
  limited.opens.erase(limited.opens.begin(),limited.opens.end()-40);
@@ -451,10 +463,15 @@ void snapshotsAndLag() {
   if(failure==1)broken.lag=1;
   if(failure==2)broken.timeShortfall=1;
   if(failure==3)broken.valueShortfall=1;
-  d.calculate(0);require(Pending[0]>0,"inconsistent source snapshot must be retried");
-  require(Lower[0]==EMPTY_VALUE,"misaligned/short copy must not publish a latest value");
+  d.calculate(0);
+  if(failure==2) {
+   parity(d); // Exact-time point reads can safely recover a failed bulk time copy.
+  } else {
+   require(Pending[0]>0,"inconsistent/unavailable source snapshot must be retried");
+   require(Lower[0]==EMPTY_VALUE,"misaligned/unreadable copy must not publish a latest value");
+  }
   broken.lag=broken.timeShortfall=broken.valueShortfall=0;
-  milliseconds+=300;serverNow=std::max(serverNow,broken.opens.back()+1);d.calculate(70);parity(d);
+  milliseconds+=1100;serverNow=std::max(serverNow,broken.opens.back()+1);d.calculate(70);parity(d);
  }
 }
 void cancellation() {
@@ -477,6 +494,56 @@ void boundedWork() {
  require(maxCopyRequest<=8,"ordinary tick must only copy a tiny source block");
  require(barShiftCalls<=5 && copyCalls<=5,"ordinary tick should update one point per line");
 }
+void reportedCountsAreHints() {
+ for(int report:{-1,0,32}) {
+  resetHarness(PERIOD_M15);InpAutoTimeframes=true;start();
+  Chart d(stamp(2026,1,1),100);serverNow=d.newest()+7*60+30;coverAll(d.oldest(),serverNow);
+  // Reproduce the reported M15 chart: H1 is fully reported, while the other
+  // independent handles already expose valid recent data but report fewer bars.
+  for(int k:{0,1,2,4}) {
+   handles[Handles[k]].reportedCount=report;
+   handles[Handles[k]].readableRecent=32;
+  }
+  require(d.calculate(0)==100,"short calculated count must not reset the chart");
+  for(int k=0;k<5;k++)for(int i=0;i<3;i++)
+   equal((*plots()[k])[i],expectedAt(k,d,i),"valid recent RSI/SMA hidden by reported calculated count");
+  require(Lower[3]==EMPTY_VALUE,"unavailable old M1 value must remain empty");
+  for(auto& pair:sources)pair.second.rsi.back()=34+int(pair.first)%9;
+  milliseconds+=50;maxCopyRequest=0;d.calculate(100);
+  for(int k=0;k<5;k++)equal((*plots()[k])[0],expectedAt(k,d,0),"recent line disappeared during historical retry throttle");
+  require(maxCopyRequest<=8,"pending prefix must not force a full replay every tick");
+  for(auto& pair:handles) {pair.second.reportedCount=INT_MIN;pair.second.readableRecent=-1;}
+  milliseconds+=1100;d.calculate(100);parity(d);
+ }
+}
+void partialBulkReadKeepsRecentPoints() {
+ resetHarness(PERIOD_M15);InpAutoTimeframes=true;start();
+ Chart d(stamp(2026,1,1),100);serverNow=d.newest()+7*60+30;coverAll(d.oldest(),serverNow);
+ // A requested 512-bar interval returns its latest32 samples while older
+ // indicator calculation is pending. Their dates do not match the first32 opens.
+ for(int k:{0,1,2,4})handles[Handles[k]].readableRecent=32;
+ d.calculate(0);
+ for(int k=0;k<5;k++)for(int i=0;i<3;i++)
+  equal((*plots()[k])[i],expectedAt(k,d,i),"partial bulk copy masked or misdated an available recent point");
+ require(Lower[3]==EMPTY_VALUE,"partially returned recent values must not be paired with old cache dates");
+ milliseconds+=20;maxCopyRequest=0;d.calculate(100);
+ for(int k=0;k<5;k++)equal((*plots()[k])[0],expectedAt(k,d,0),"old unavailable prefix must not blank a ready line");
+ require(maxCopyRequest<=8,"ordinary pending tick must remain bounded");
+ for(auto& pair:handles)pair.second.readableRecent=-1;
+ milliseconds+=1100;d.calculate(100);parity(d);
+}
+void unavailableFormingSamplesDoNotBlockClosedPoints() {
+ resetHarness(PERIOD_M15);InpAutoTimeframes=true;InpLiveCurrentBar=false;start();
+ Chart d(stamp(2026,1,1),100);serverNow=d.newest()+7*60+30;coverAll(d.oldest(),serverNow);
+ sources[TF[0]].lag=1;
+ sources[TF[2]].lag=1; // Both chart RSI and its SMA have an unfinished newest sample.
+ d.calculate(0);parity(d);
+ for(int k=0;k<5;k++) {
+  require((*plots()[k])[0]!=EMPTY_VALUE,"unneeded forming sample blocked a closed-source line");
+  require(Pending[k]==0,"unneeded forming sample must not keep valid closed history pending");
+ }
+ milliseconds+=20;d.calculate(100);parity(d);
+}
 int main(int argc,char** argv) {
  try {
   require(argc==2,"select scenario");string name=argv[1];
@@ -485,6 +552,8 @@ int main(int argc,char** argv) {
   else if(name=="pending")pendingAndLimitedHistory();else if(name=="invalid")invalidReadiness();
   else if(name=="history")historyCapAndReset();else if(name=="snapshot")snapshotsAndLag();
   else if(name=="stop")cancellation();else if(name=="work")boundedWork();
+  else if(name=="counts")reportedCountsAreHints();else if(name=="partial")partialBulkReadKeepsRecentPoints();
+  else if(name=="closed_lag")unavailableFormingSamplesDoNotBlockClosedPoints();
   else throw std::runtime_error("unknown scenario");
   cleanup();std::cout<<name<<" passed\n";return 0;
  } catch(const std::exception& e) {std::cerr<<e.what()<<"\n";return 1;}
@@ -509,7 +578,7 @@ class RSIAutoMTFRegression(unittest.TestCase):
         functions, prototypes = [], []
         for name in re.findall(pattern, source, re.M):
             code = extract_function(source, name).replace("std::vector<", "Array<")
-            code = re.sub(r"\b(double|datetime)\s+(\w+)\[\]\s*;", r"Array<\1> \2;", code)
+            code = re.sub(r"\b(double|datetime|int)\s+(\w+)\[\]\s*;", r"Array<\1> \2;", code)
             opening = code.index("{")
             signature = code[:opening]
             prototypes.append(signature + ";")
@@ -561,6 +630,15 @@ class RSIAutoMTFRegression(unittest.TestCase):
 
     def test_bounded_source_blocks_and_constant_tick_work(self):
         self.run_case("work")
+
+    def test_calculated_counts_do_not_hide_readable_recent_data(self):
+        self.run_case("counts")
+
+    def test_partial_bulk_window_keeps_recent_lines_visible(self):
+        self.run_case("partial")
+
+    def test_unavailable_forming_samples_do_not_block_closed_source_points(self):
+        self.run_case("closed_lag")
 
 
 if __name__ == "__main__":

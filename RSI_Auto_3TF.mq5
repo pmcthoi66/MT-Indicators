@@ -2,7 +2,7 @@
 // Historical points use RSI bars closed at that time.
 // Added: SMA 7 of the current chart timeframe RSI.
 #property copyright "RSI Auto 4TF"
-#property version "1.30"
+#property version "1.31"
 #property strict
 #property indicator_separate_window
 #property indicator_buffers 5
@@ -75,6 +75,7 @@ datetime LastNewest=0,LastOldest=0;
 int Pending[5]={0,0,0,0,0};
 ulong RetryAfter[5]={0,0,0,0,0};
 datetime SourceFirst[5]={0,0,0,0,0};
+int CalculatedSeen[5]={0,0,0,0,0};
 
 //------------------------------------------------------------------
 string TFName(ENUM_TIMEFRAMES tf)
@@ -289,7 +290,7 @@ int OnInit()
  LastNewest=0; LastOldest=0;
  for(int k=0;k<5;k++)
  {
-  Pending[k]=0; RetryAfter[k]=0; SourceFirst[k]=0;
+  Pending[k]=0; RetryAfter[k]=0; SourceFirst[k]=0; CalculatedSeen[k]=0;
  }
  color colors[]={InpLowerColor,InpCurrentColor,InpHigherColor,InpFourthColor};
  ENUM_LINE_STYLE styles[]={STYLE_DOT,STYLE_SOLID,STYLE_DASH,STYLE_DASHDOT};
@@ -361,14 +362,35 @@ int ChartShift(const datetime &times[],const int count,const datetime stamp)
  return -1;
 }
 
-// Bind values to an absolute time interval: a lagging indicator cannot silently
-// pair its old position zero with newer source timestamps.
+bool SourceStable(const int k,const int sourceBars,const datetime newest)
+{
+ return !_StopFlag && iBars(_Symbol,TF[k])==sourceBars && iTime(_Symbol,TF[k],0)==newest;
+}
+
+// A successful read of the requested date is the readiness authority. An RSI
+// handle need not have calculated every bar reported by iBars(). The request
+// also starts on-demand calculation on a non-chart timeframe.
+bool ReadExact(const int k,const datetime opened,const int sourceBars,
+               const datetime newest,double &value)
+{
+ value=EMPTY_VALUE;
+ if(!SourceStable(k,sourceBars,newest)) return false;
+ double sample[];
+ ArraySetAsSeries(sample,false);
+ int copied=CopyBuffer(Handles[k],0,(datetime)opened,(datetime)opened,sample);
+ if(copied!=1 || ArraySize(sample)!=1 || !SourceStable(k,sourceBars,newest) ||
+    !ValidRSI(sample[0])) return false;
+ value=sample[0];
+ return true;
+}
+
+// Bind bulk values to absolute dates. A partial response has no assumed
+// position: discard it, then resolve only the selected dates individually.
 bool SourceChunk(const int k,const int first,const int limit,
                  const int sourceBars,const datetime newest,
-                 double &values[],datetime &opens[])
+                 double &values[],datetime &opens[],int &state[])
 {
- if(_StopFlag || iBars(_Symbol,TF[k])!=sourceBars ||
-    iTime(_Symbol,TF[k],0)!=newest || BarsCalculated(Handles[k])<sourceBars) return false;
+ if(!SourceStable(k,sourceBars,newest)) return false;
  int wanted=MathMin(limit,sourceBars-first);
  if(wanted<1) return false;
  ArraySetAsSeries(values,false);
@@ -379,8 +401,40 @@ bool SourceChunk(const int k,const int first,const int limit,
   if(opens[i]<=0 || (i>0 && opens[i]<=opens[i-1])) return false;
  if(_StopFlag) return false;
  int copied=CopyBuffer(Handles[k],0,(datetime)opens[0],(datetime)opens[wanted-1],values);
- return !_StopFlag && copied==wanted && ArraySize(values)==wanted && iBars(_Symbol,TF[k])==sourceBars &&
-        iTime(_Symbol,TF[k],0)==newest && BarsCalculated(Handles[k])>=sourceBars;
+ if(!SourceStable(k,sourceBars,newest)) return false;
+ if(ArrayResize(state,wanted)!=wanted) return false;
+ ArrayInitialize(state,0);
+ if(copied==wanted && ArraySize(values)==wanted)
+ {
+  for(int i=0;i<wanted && !_StopFlag;i++) state[i]=ValidRSI(values[i]) ? 1 : -1;
+ }
+ else
+ {
+  if(ArrayResize(values,wanted)!=wanted) return false;
+  ArrayInitialize(values,EMPTY_VALUE);
+ }
+ return !_StopFlag;
+}
+
+// A time-history block can be pending too. Probe the actual candidate rather
+// than requiring unrelated newer/older source candles to be readable.
+bool ReadPoint(const int k,const datetime endpoint,const bool live,const int sourceBars,
+               const datetime newest,const long warmup,double &value)
+{
+ value=EMPTY_VALUE;
+ if(!SourceStable(k,sourceBars,newest)) return false;
+ int shift=iBarShift(_Symbol,TF[k],endpoint,false);
+ if(shift<0) return false;
+ datetime opened=iTime(_Symbol,TF[k],shift);
+ if(opened<=0 || opened>endpoint) return false;
+ if(!live)
+ {
+  datetime closed=BarClose(opened,TF[k]);
+  if(closed<=0) return false;
+  if(closed>endpoint) { shift++; opened=iTime(_Symbol,TF[k],shift); }
+ }
+ if(shift>=sourceBars-warmup) return true;
+ return opened>0 && opened<=endpoint && ReadExact(k,opened,sourceBars,newest,value);
 }
 
 //------------------------------------------------------------------
@@ -392,6 +446,7 @@ bool FillLine(const int k,double &dest[],const datetime &times[],const int count
  if(sourceBars<=warmup) return true; // Expected RSI/SMA warmup, not an error.
  double values[];
  datetime opens[];
+ int state[];
  int cacheFirst=-1;
  datetime ceiling=0;
  int chartSeconds=PeriodSeconds((ENUM_TIMEFRAMES)_Period);
@@ -411,18 +466,27 @@ bool FillLine(const int k,double &dest[],const datetime &times[],const int count
   }
   if(endpoint<=0) { complete=false; continue; }
   if(endpoint<firstSource) continue; // Render the available overlap.
+  bool live=(i==0 && InpLiveCurrentBar);
   if(cacheFirst<0 || endpoint<opens[0] || endpoint>ceiling)
   {
    int shift=iBarShift(_Symbol,TF[k],endpoint,false);
    if(shift<0) { complete=false; continue; }
    cacheFirst=MathMax(0,shift-1);
-   if(!SourceChunk(k,cacheFirst,limit,sourceBars,newestSource,values,opens)) return false;
+   if(!SourceChunk(k,cacheFirst,limit,sourceBars,newestSource,values,opens,state))
+   {
+    cacheFirst=-1;
+    if(!SourceStable(k,sourceBars,newestSource)) return false;
+    double point;
+    if(ReadPoint(k,endpoint,live,sourceBars,newestSource,warmup,point))
+    { if(ValidRSI(point)) dest[i]=point; }
+    else complete=false;
+    continue;
+   }
    ceiling=endpoint;
   }
   int position=SourcePosition(opens,endpoint);
   if(position<0) { complete=false; continue; }
   int shift=cacheFirst+ArraySize(opens)-1-position;
-  bool live=(i==0 && InpLiveCurrentBar);
   if(!live)
   {
    datetime closed=BarClose(opens[position],TF[k]);
@@ -433,7 +497,16 @@ bool FillLine(const int k,double &dest[],const datetime &times[],const int count
   if(position<0)
   {
    cacheFirst=MathMax(0,shift-1);
-   if(!SourceChunk(k,cacheFirst,limit,sourceBars,newestSource,values,opens)) return false;
+   if(!SourceChunk(k,cacheFirst,limit,sourceBars,newestSource,values,opens,state))
+   {
+    cacheFirst=-1;
+    if(!SourceStable(k,sourceBars,newestSource)) return false;
+    double point;
+    if(ReadPoint(k,endpoint,live,sourceBars,newestSource,warmup,point))
+    { if(ValidRSI(point)) dest[i]=point; }
+    else complete=false;
+    continue;
+   }
    ceiling=endpoint;
    position=SourcePosition(opens,endpoint);
    if(position>=0 && !live)
@@ -446,9 +519,15 @@ bool FillLine(const int k,double &dest[],const datetime &times[],const int count
    if(shift>=sourceBars-warmup) continue;
   }
   if(position<0 || position>=ArraySize(values)) { complete=false; continue; }
-  double value=values[position];
-  if(!ValidRSI(value)) { complete=false; continue; }
-  dest[i]=value;
+  if(state[position]==0)
+  {
+   double point;
+   if(ReadExact(k,opens[position],sourceBars,newestSource,point))
+   { values[position]=point; state[position]=1; }
+   else state[position]=-1;
+  }
+  if(state[position]!=1) { complete=false; continue; }
+  dest[i]=values[position];
  }
  return !_StopFlag && complete && iBars(_Symbol,TF[k])==sourceBars &&
         iTime(_Symbol,TF[k],0)==newestSource;
@@ -458,32 +537,34 @@ void UpdateLine(const int k,double &dest[],const datetime &times[],
                 const int baseCount,const int total,const int newBars,
                 const datetime now,const ulong clock)
 {
- int count=baseCount;
- if(Pending[k]>0) count=MathMax(count,(int)MathMin((long)total,(long)Pending[k]+newBars));
- if(Pending[k]>0 && clock<RetryAfter[k])
- {
-  ClearLine(dest,0,baseCount);
-  Pending[k]=count;
-  return;
- }
+ int backlog=baseCount;
+ bool waiting=Pending[k]>0;
+ if(waiting) backlog=MathMax(backlog,(int)MathMin((long)total,(long)Pending[k]+newBars));
+ int calculated=BarsCalculated(Handles[k]);
+ bool replay=!waiting || clock>=RetryAfter[k] || calculated>CalculatedSeen[k];
+ int count=replay ? backlog : baseCount;
  int bars=iBars(_Symbol,TF[k]);
  datetime first=bars>0 ? iTime(_Symbol,TF[k],bars-1) : 0;
  datetime newest=bars>0 ? iTime(_Symbol,TF[k],0) : 0;
  // Loading older source history can fill points previously outside coverage.
  // Normal retirement of old source bars does not invalidate published points.
- if(SourceFirst[k]==0 || (first>0 && first<SourceFirst[k])) count=total;
- ClearLine(dest,0,count);
- bool ready=bars>0 && first>0 && newest>0 && BarsCalculated(Handles[k])>=bars;
+ if(SourceFirst[k]==0 || (first>0 && first<SourceFirst[k])) { count=total; replay=true; }
+ // Preserve published closed points while older data is pending. Even while
+ // throttling historical retries, refresh the changing points independently.
+ ClearLine(dest,0,baseCount);
+ bool ready=bars>0 && first>0 && newest>0;
  if(ready) ready=FillLine(k,dest,times,count,now,bars,first,newest);
  if(_StopFlag) return;
- if(ready)
+ CalculatedSeen[k]=calculated;
+ if(bars>0 && first>0 && SourceStable(k,bars,newest)) SourceFirst[k]=first;
+ if(ready && count>=backlog)
  {
-  SourceFirst[k]=first;
   Pending[k]=0; RetryAfter[k]=0;
  }
  else
  {
-  Pending[k]=count; RetryAfter[k]=clock+250;
+  Pending[k]=MathMax(backlog,count);
+  if(replay) RetryAfter[k]=clock+(count>baseCount ? 1000 : 250);
  }
 }
 
@@ -512,7 +593,7 @@ int OnCalculate(const int rates_total,const int prev_calculated,
   ArrayInitialize(Lower,EMPTY_VALUE); ArrayInitialize(Current,EMPTY_VALUE);
   ArrayInitialize(Higher,EMPTY_VALUE); ArrayInitialize(Fourth,EMPTY_VALUE);
   ArrayInitialize(SMA7,EMPTY_VALUE);
-  for(int k=0;k<5;k++) { Pending[k]=0; RetryAfter[k]=0; SourceFirst[k]=0; }
+  for(int k=0;k<5;k++) { Pending[k]=0; RetryAfter[k]=0; SourceFirst[k]=0; CalculatedSeen[k]=0; }
   newBars=0;
  }
  else
