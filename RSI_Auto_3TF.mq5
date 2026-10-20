@@ -2,7 +2,7 @@
 // Historical points use RSI bars closed at that time.
 // Added: SMA 7 of the current chart timeframe RSI.
 #property copyright "RSI Auto 4TF"
-#property version "1.21"
+#property version "1.30"
 #property strict
 #property indicator_separate_window
 #property indicator_buffers 5
@@ -72,6 +72,9 @@ int Handles[5]=
 int SMAInputHandle=INVALID_HANDLE;
 
 datetime LastNewest=0,LastOldest=0;
+int Pending[5]={0,0,0,0,0};
+ulong RetryAfter[5]={0,0,0,0,0};
+datetime SourceFirst[5]={0,0,0,0,0};
 
 //------------------------------------------------------------------
 string TFName(ENUM_TIMEFRAMES tf)
@@ -206,290 +209,333 @@ void SelectFrames()
 }
 
 //------------------------------------------------------------------
+bool ValidFrame(const ENUM_TIMEFRAMES tf)
+{
+ switch(tf)
+ {
+  case PERIOD_M1: case PERIOD_M2: case PERIOD_M3: case PERIOD_M4:
+  case PERIOD_M5: case PERIOD_M6: case PERIOD_M10: case PERIOD_M12:
+  case PERIOD_M15: case PERIOD_M20: case PERIOD_M30:
+  case PERIOD_H1: case PERIOD_H2: case PERIOD_H3: case PERIOD_H4:
+  case PERIOD_H6: case PERIOD_H8: case PERIOD_H12:
+  case PERIOD_D1: case PERIOD_W1: case PERIOD_MN1: return true;
+ }
+ return false;
+}
+
+bool ValidRSI(const double value)
+{
+ return value!=EMPTY_VALUE && MathIsValidNumber(value) && value>=0.0 && value<=100.0;
+}
+
+// Calendar months cannot be represented by PeriodSeconds(PERIOD_MN1).
+datetime BarClose(const datetime opened,const ENUM_TIMEFRAMES tf)
+{
+ if(tf==PERIOD_MN1)
+ {
+  MqlDateTime parts;
+  if(!TimeToStruct(opened,parts)) return 0;
+  parts.day=1; parts.hour=0; parts.min=0; parts.sec=0;
+  if(++parts.mon>12) { parts.mon=1; parts.year++; }
+  return StructToTime(parts);
+ }
+ int seconds=PeriodSeconds(tf);
+ return seconds>0 ? opened+seconds : 0;
+}
+
+void ReleaseSources()
+{
+ // Release the dependent SMA before its input and each borrowed RSI once.
+ for(int k=4;k>=0;k--)
+ {
+  int handle=Handles[k];
+  if(handle==INVALID_HANDLE) continue;
+  for(int j=0;j<k;j++)
+   if(Handles[j]==handle) Handles[j]=INVALID_HANDLE;
+  if(SMAInputHandle==handle) SMAInputHandle=INVALID_HANDLE;
+  IndicatorRelease(handle);
+  Handles[k]=INVALID_HANDLE;
+ }
+ if(SMAInputHandle!=INVALID_HANDLE)
+ {
+  IndicatorRelease(SMAInputHandle);
+  SMAInputHandle=INVALID_HANDLE;
+ }
+}
+
+//------------------------------------------------------------------
 int OnInit()
 {
- if(InpRSIPeriod<2 || InpHistoryBars<100)
+ ReleaseSources();
+ if(InpRSIPeriod<2 || InpHistoryBars<100 ||
+    (int)InpPrice<(int)PRICE_CLOSE || (int)InpPrice>(int)PRICE_WEIGHTED)
   return INIT_PARAMETERS_INCORRECT;
+ SelectFrames();
+ TF[4]=(ENUM_TIMEFRAMES)_Period;
+ for(int k=0;k<5;k++)
+  if(!ValidFrame(TF[k])) return INIT_PARAMETERS_INCORRECT;
 
- SetIndexBuffer(0,Lower,INDICATOR_DATA);
- SetIndexBuffer(1,Current,INDICATOR_DATA);
- SetIndexBuffer(2,Higher,INDICATOR_DATA);
- SetIndexBuffer(3,Fourth,INDICATOR_DATA);
- SetIndexBuffer(4,SMA7,INDICATOR_DATA);
-
+ if(!SetIndexBuffer(0,Lower,INDICATOR_DATA) ||
+    !SetIndexBuffer(1,Current,INDICATOR_DATA) ||
+    !SetIndexBuffer(2,Higher,INDICATOR_DATA) ||
+    !SetIndexBuffer(3,Fourth,INDICATOR_DATA) ||
+    !SetIndexBuffer(4,SMA7,INDICATOR_DATA)) return INIT_FAILED;
  ArraySetAsSeries(Lower,true);
  ArraySetAsSeries(Current,true);
  ArraySetAsSeries(Higher,true);
  ArraySetAsSeries(Fourth,true);
  ArraySetAsSeries(SMA7,true);
 
- SelectFrames();
-
- color colors[]=
+ LastNewest=0; LastOldest=0;
+ for(int k=0;k<5;k++)
  {
-  InpLowerColor,
-  InpCurrentColor,
-  InpHigherColor,
-  InpFourthColor
- };
-
- ENUM_LINE_STYLE styles[]=
- {
-  STYLE_DOT,
-  STYLE_SOLID,
-  STYLE_DASH,
-  STYLE_DASHDOT
- };
-
+  Pending[k]=0; RetryAfter[k]=0; SourceFirst[k]=0;
+ }
+ color colors[]={InpLowerColor,InpCurrentColor,InpHigherColor,InpFourthColor};
+ ENUM_LINE_STYLE styles[]={STYLE_DOT,STYLE_SOLID,STYLE_DASH,STYLE_DASHDOT};
  string title="RSI 4TF ("+IntegerToString(InpRSIPeriod)+") ";
-
  for(int k=0;k<4;k++)
  {
-  Handles[k]=iRSI(_Symbol,TF[k],InpRSIPeriod,InpPrice);
-
+  Handles[k]=INVALID_HANDLE;
+  for(int j=0;j<k;j++)
+   if(TF[j]==TF[k]) { Handles[k]=Handles[j]; break; }
   if(Handles[k]==INVALID_HANDLE)
-   return INIT_FAILED;
-
+   Handles[k]=iRSI(_Symbol,TF[k],InpRSIPeriod,InpPrice);
+  if(Handles[k]==INVALID_HANDLE) { ReleaseSources(); return INIT_FAILED; }
   PlotIndexSetString(k,PLOT_LABEL,"RSI "+TFName(TF[k]));
   PlotIndexSetInteger(k,PLOT_LINE_COLOR,colors[k]);
   PlotIndexSetInteger(k,PLOT_LINE_WIDTH,1);
-
-  PlotIndexSetInteger(
-   k,
-   PLOT_LINE_STYLE,
-   TF[k]==(ENUM_TIMEFRAMES)_Period
-   ? STYLE_SOLID
-   : (k==1 ? STYLE_DASHDOTDOT : styles[k])
-  );
-
+  PlotIndexSetInteger(k,PLOT_LINE_STYLE,TF[k]==(ENUM_TIMEFRAMES)_Period
+                      ? STYLE_SOLID : (k==1 ? STYLE_DASHDOTDOT : styles[k]));
   PlotIndexSetDouble(k,PLOT_EMPTY_VALUE,EMPTY_VALUE);
-
   title+=TFName(TF[k])+(k<3 ? " / " : "");
  }
-
- // SMA 7 uses the RSI of the current chart timeframe.
- TF[4]=(ENUM_TIMEFRAMES)_Period;
-
- SMAInputHandle=iRSI(
-  _Symbol,
-  TF[4],
-  InpRSIPeriod,
-  InpPrice
- );
-
+ SMAInputHandle=INVALID_HANDLE;
+ for(int k=0;k<4;k++)
+  if(TF[k]==TF[4]) { SMAInputHandle=Handles[k]; break; }
  if(SMAInputHandle==INVALID_HANDLE)
-  return INIT_FAILED;
-
- Handles[4]=iMA(
-  _Symbol,
-  TF[4],
-  7,
-  0,
-  MODE_SMA,
-  SMAInputHandle
- );
-
- if(Handles[4]==INVALID_HANDLE)
-  return INIT_FAILED;
-
- PlotIndexSetString(
-  4,
-  PLOT_LABEL,
-  "RSI SMA 7 "+TFName(TF[4])
- );
-
+  SMAInputHandle=iRSI(_Symbol,TF[4],InpRSIPeriod,InpPrice);
+ if(SMAInputHandle==INVALID_HANDLE) { ReleaseSources(); return INIT_FAILED; }
+ Handles[4]=iMA(_Symbol,TF[4],7,0,MODE_SMA,SMAInputHandle);
+ if(Handles[4]==INVALID_HANDLE) { ReleaseSources(); return INIT_FAILED; }
+ PlotIndexSetString(4,PLOT_LABEL,"RSI SMA 7 "+TFName(TF[4]));
  PlotIndexSetInteger(4,PLOT_LINE_COLOR,clrYellow);
  PlotIndexSetInteger(4,PLOT_LINE_WIDTH,1);
  PlotIndexSetInteger(4,PLOT_LINE_STYLE,STYLE_SOLID);
  PlotIndexSetDouble(4,PLOT_EMPTY_VALUE,EMPTY_VALUE);
-
- IndicatorSetString(
-  INDICATOR_SHORTNAME,
-  title+" | SMA 7 "+TFName(TF[4])
- );
-
+ IndicatorSetString(INDICATOR_SHORTNAME,title+" | SMA 7 "+TFName(TF[4])+
+                    (InpLiveCurrentBar ? " | live current" : " | closed sources"));
  IndicatorSetInteger(INDICATOR_DIGITS,2);
-
  return INIT_SUCCEEDED;
 }
 
-//------------------------------------------------------------------
-bool FillLine(
- const int k,
- double &dest[],
- const datetime &times[],
- const int count
-)
+void ClearLine(double &dest[],const int first,const int end)
 {
- int oldest=iBarShift(
-  _Symbol,
-  TF[k],
-  times[count-1],
-  false
- );
+ for(int i=first;i<end && !_StopFlag;i++) dest[i]=EMPTY_VALUE;
+}
 
- if(oldest<0)
-  return false;
-
- int available=BarsCalculated(Handles[k]);
-
- // SMA 7 requires six additional RSI values.
- int warmup=InpRSIPeriod+(k==4 ? 6 : 0);
-
- if(available<=warmup)
-  return false;
-
- int wanted=MathMin(oldest+3,available);
-
- double values[];
- datetime opens[];
-
- ArraySetAsSeries(values,true);
- ArraySetAsSeries(opens,true);
-
- int copied=CopyBuffer(
-  Handles[k],
-  0,
-  0,
-  wanted,
-  values
- );
-
- int dated=CopyTime(
-  _Symbol,
-  TF[k],
-  0,
-  wanted,
-  opens
- );
-
- if(copied!=wanted || dated!=wanted)
-  return false;
-
- for(int i=count-1;i>=0;i--)
+// Position of the newest source opening not later than the requested time.
+// Cache arrays use chronological order, unlike the five plot buffers.
+int SourcePosition(const datetime &opens[],const datetime endpoint)
+{
+ int left=0,right=ArraySize(opens);
+ while(left<right)
  {
-  bool live=(i==0 && InpLiveCurrentBar);
-
-  datetime endpoint=(
-   i==0 ? TimeCurrent() : times[i-1]
-  );
-
-  int shift=iBarShift(
-   _Symbol,
-   TF[k],
-   endpoint,
-   false
-  );
-
-  if(shift<0 || shift>=wanted)
-  {
-   dest[i]=EMPTY_VALUE;
-   continue;
-  }
-
-  // Use only closed source candles unless the current point is live.
-  if(!live)
-  {
-   if(shift==0 || opens[shift-1]>endpoint)
-    shift++;
-  }
-
-  dest[i]=(
-   shift<wanted && shift<available-warmup
-   ? values[shift]
-   : EMPTY_VALUE
-  );
+  int middle=left+(right-left)/2;
+  if(opens[middle]<=endpoint) left=middle+1;
+  else right=middle;
  }
+ return left-1;
+}
 
- return true;
+int ChartShift(const datetime &times[],const int count,const datetime stamp)
+{
+ int left=0,right=count-1;
+ while(left<=right)
+ {
+  int middle=left+(right-left)/2;
+  if(times[middle]==stamp) return middle;
+  if(times[middle]>stamp) left=middle+1;
+  else right=middle-1;
+ }
+ return -1;
+}
+
+// Bind values to an absolute time interval: a lagging indicator cannot silently
+// pair its old position zero with newer source timestamps.
+bool SourceChunk(const int k,const int first,const int limit,
+                 const int sourceBars,const datetime newest,
+                 double &values[],datetime &opens[])
+{
+ if(_StopFlag || iBars(_Symbol,TF[k])!=sourceBars ||
+    iTime(_Symbol,TF[k],0)!=newest || BarsCalculated(Handles[k])<sourceBars) return false;
+ int wanted=MathMin(limit,sourceBars-first);
+ if(wanted<1) return false;
+ ArraySetAsSeries(values,false);
+ ArraySetAsSeries(opens,false);
+ int dated=CopyTime(_Symbol,TF[k],first,wanted,opens);
+ if(dated!=wanted || ArraySize(opens)!=wanted || _StopFlag) return false;
+ for(int i=0;i<wanted && !_StopFlag;i++)
+  if(opens[i]<=0 || (i>0 && opens[i]<=opens[i-1])) return false;
+ if(_StopFlag) return false;
+ int copied=CopyBuffer(Handles[k],0,(datetime)opens[0],(datetime)opens[wanted-1],values);
+ return !_StopFlag && copied==wanted && ArraySize(values)==wanted && iBars(_Symbol,TF[k])==sourceBars &&
+        iTime(_Symbol,TF[k],0)==newest && BarsCalculated(Handles[k])>=sourceBars;
 }
 
 //------------------------------------------------------------------
-int OnCalculate(
- const int rates_total,
- const int prev_calculated,
- const datetime &time[],
- const double &open[],
- const double &high[],
- const double &low[],
- const double &close[],
- const long &tick_volume[],
- const long &volume[],
- const int &spread[]
-)
+bool FillLine(const int k,double &dest[],const datetime &times[],const int count,
+              const datetime now,const int sourceBars,const datetime firstSource,
+              const datetime newestSource)
 {
- if(rates_total<2)
-  return 0;
+ long warmup=(long)InpRSIPeriod+(k==4 ? 6 : 0);
+ if(sourceBars<=warmup) return true; // Expected RSI/SMA warmup, not an error.
+ double values[];
+ datetime opens[];
+ int cacheFirst=-1;
+ datetime ceiling=0;
+ int chartSeconds=PeriodSeconds((ENUM_TIMEFRAMES)_Period);
+ int sourceSeconds=PeriodSeconds(TF[k]);
+ // Sparse lower-frame samples need tiny blocks; dense histories amortize the
+ // lookups over bounded blocks. No source allocation can grow with TF ratio.
+ int limit=(count<=2 || (double)chartSeconds/sourceSeconds>64.0) ? 8 : 512;
+ bool complete=true;
+ for(int i=0;i<count && !_StopFlag;i++)
+ {
+  datetime endpoint=now;
+  if(i>0)
+  {
+   endpoint=BarClose(times[i],(ENUM_TIMEFRAMES)_Period);
+   // An actual earlier opening can terminate a shortened chart candle.
+   if(times[i-1]>times[i] && times[i-1]<endpoint) endpoint=times[i-1];
+  }
+  if(endpoint<=0) { complete=false; continue; }
+  if(endpoint<firstSource) continue; // Render the available overlap.
+  if(cacheFirst<0 || endpoint<opens[0] || endpoint>ceiling)
+  {
+   int shift=iBarShift(_Symbol,TF[k],endpoint,false);
+   if(shift<0) { complete=false; continue; }
+   cacheFirst=MathMax(0,shift-1);
+   if(!SourceChunk(k,cacheFirst,limit,sourceBars,newestSource,values,opens)) return false;
+   ceiling=endpoint;
+  }
+  int position=SourcePosition(opens,endpoint);
+  if(position<0) { complete=false; continue; }
+  int shift=cacheFirst+ArraySize(opens)-1-position;
+  bool live=(i==0 && InpLiveCurrentBar);
+  if(!live)
+  {
+   datetime closed=BarClose(opens[position],TF[k]);
+   if(closed<=0) { complete=false; continue; }
+   if(closed>endpoint) { shift++; position--; }
+  }
+  if(shift>=sourceBars-warmup) continue;
+  if(position<0)
+  {
+   cacheFirst=MathMax(0,shift-1);
+   if(!SourceChunk(k,cacheFirst,limit,sourceBars,newestSource,values,opens)) return false;
+   ceiling=endpoint;
+   position=SourcePosition(opens,endpoint);
+   if(position>=0 && !live)
+   {
+    datetime closed=BarClose(opens[position],TF[k]);
+    if(closed<=0) { complete=false; continue; }
+    if(closed>endpoint) position--;
+   }
+   shift=cacheFirst+ArraySize(opens)-1-position;
+   if(shift>=sourceBars-warmup) continue;
+  }
+  if(position<0 || position>=ArraySize(values)) { complete=false; continue; }
+  double value=values[position];
+  if(!ValidRSI(value)) { complete=false; continue; }
+  dest[i]=value;
+ }
+ return !_StopFlag && complete && iBars(_Symbol,TF[k])==sourceBars &&
+        iTime(_Symbol,TF[k],0)==newestSource;
+}
 
+void UpdateLine(const int k,double &dest[],const datetime &times[],
+                const int baseCount,const int total,const int newBars,
+                const datetime now,const ulong clock)
+{
+ int count=baseCount;
+ if(Pending[k]>0) count=MathMax(count,(int)MathMin((long)total,(long)Pending[k]+newBars));
+ if(Pending[k]>0 && clock<RetryAfter[k])
+ {
+  ClearLine(dest,0,baseCount);
+  Pending[k]=count;
+  return;
+ }
+ int bars=iBars(_Symbol,TF[k]);
+ datetime first=bars>0 ? iTime(_Symbol,TF[k],bars-1) : 0;
+ datetime newest=bars>0 ? iTime(_Symbol,TF[k],0) : 0;
+ // Loading older source history can fill points previously outside coverage.
+ // Normal retirement of old source bars does not invalidate published points.
+ if(SourceFirst[k]==0 || (first>0 && first<SourceFirst[k])) count=total;
+ ClearLine(dest,0,count);
+ bool ready=bars>0 && first>0 && newest>0 && BarsCalculated(Handles[k])>=bars;
+ if(ready) ready=FillLine(k,dest,times,count,now,bars,first,newest);
+ if(_StopFlag) return;
+ if(ready)
+ {
+  SourceFirst[k]=first;
+  Pending[k]=0; RetryAfter[k]=0;
+ }
+ else
+ {
+  Pending[k]=count; RetryAfter[k]=clock+250;
+ }
+}
+
+//------------------------------------------------------------------
+int OnCalculate(const int rates_total,const int prev_calculated,
+ const datetime &time[],const double &open[],const double &high[],const double &low[],
+ const double &close[],const long &tick_volume[],const long &volume[],const int &spread[])
+{
+ if(rates_total<1 || _StopFlag) return 0;
  ArraySetAsSeries(time,true);
-
- bool reset=(
-  prev_calculated<=0 ||
-  prev_calculated>rates_total ||
-  LastOldest!=time[rates_total-1] ||
-  (prev_calculated==rates_total && LastNewest!=time[0])
- );
-
+ bool reset=prev_calculated<=0 || prev_calculated>rates_total || LastNewest==0;
+ int newBars=0;
+ if(!reset)
+ {
+  if(time[0]!=LastNewest)
+  {
+   newBars=ChartShift(time,rates_total,LastNewest);
+   if(newBars<1 || time[rates_total-1]<LastOldest) reset=true;
+  }
+  else if(prev_calculated!=rates_total || LastOldest!=time[rates_total-1]) reset=true;
+ }
+ int total=MathMin(rates_total,InpHistoryBars);
+ int count=reset ? total : MathMin(total,newBars+1);
  if(reset)
  {
-  ArrayInitialize(Lower,EMPTY_VALUE);
-  ArrayInitialize(Current,EMPTY_VALUE);
-  ArrayInitialize(Higher,EMPTY_VALUE);
-  ArrayInitialize(Fourth,EMPTY_VALUE);
+  ArrayInitialize(Lower,EMPTY_VALUE); ArrayInitialize(Current,EMPTY_VALUE);
+  ArrayInitialize(Higher,EMPTY_VALUE); ArrayInitialize(Fourth,EMPTY_VALUE);
   ArrayInitialize(SMA7,EMPTY_VALUE);
+  for(int k=0;k<5;k++) { Pending[k]=0; RetryAfter[k]=0; SourceFirst[k]=0; }
+  newBars=0;
  }
-
- int total=MathMin(rates_total,InpHistoryBars);
-
- int count=(
-  reset
-  ? total
-  : MathMin(total,rates_total-prev_calculated+2)
- );
-
- if(count<1)
-  count=1;
-
- bool a=FillLine(0,Lower,time,count);
- bool b=FillLine(1,Current,time,count);
- bool c=FillLine(2,Higher,time,count);
- bool d=FillLine(3,Fourth,time,count);
- bool e=FillLine(4,SMA7,time,count);
-
- if(total<rates_total)
+ else
  {
-  Lower[total]=EMPTY_VALUE;
-  Current[total]=EMPTY_VALUE;
-  Higher[total]=EMPTY_VALUE;
-  Fourth[total]=EMPTY_VALUE;
-  SMA7[total]=EMPTY_VALUE;
+  int end=(int)MathMin((long)rates_total,(long)MathMin(prev_calculated,InpHistoryBars)+newBars);
+  ClearLine(Lower,total,end); ClearLine(Current,total,end);
+  ClearLine(Higher,total,end); ClearLine(Fourth,total,end); ClearLine(SMA7,total,end);
  }
-
- if(a && b && c && d && e)
- {
-  LastNewest=time[0];
-  LastOldest=time[rates_total-1];
-  return rates_total;
- }
-
- return 0;
+ datetime now=TimeCurrent();
+ ulong clock=GetTickCount64();
+ UpdateLine(0,Lower,time,count,total,newBars,now,clock);
+ UpdateLine(1,Current,time,count,total,newBars,now,clock);
+ UpdateLine(2,Higher,time,count,total,newBars,now,clock);
+ UpdateLine(3,Fourth,time,count,total,newBars,now,clock);
+ UpdateLine(4,SMA7,time,count,total,newBars,now,clock);
+ if(_StopFlag) return 0;
+ LastNewest=time[0]; LastOldest=time[rates_total-1];
+ // Each line owns its pending suffix; one unavailable TF does not reset all.
+ return rates_total;
 }
 
 //------------------------------------------------------------------
 void OnDeinit(const int reason)
 {
- for(int k=4;k>=0;k--)
- {
-  if(Handles[k]!=INVALID_HANDLE)
-  {
-   IndicatorRelease(Handles[k]);
-   Handles[k]=INVALID_HANDLE;
-  }
- }
-
- if(SMAInputHandle!=INVALID_HANDLE)
- {
-  IndicatorRelease(SMAInputHandle);
-  SMAInputHandle=INVALID_HANDLE;
- }
+ ReleaseSources();
 }
